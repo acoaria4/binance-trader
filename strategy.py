@@ -4,12 +4,12 @@ ML Strategy Engine: trains a LightGBM classifier that predicts
 whether the next N candles will produce a profitable long signal.
 
 Signal classes:
-  1 = BUY  (price expected to rise > take_profit threshold)
-  0 = HOLD
- -1 = SELL (price expected to drop > stop_loss threshold)
+  1 = BUY  (top 25% forward return opportunities)
+  0 = HOLD (middle 50%)
+ -1 = SELL (bottom 25% — worst forward return windows)
 
-The bot only trades class 1 long signals (long-only for safety
-on testnet; short selling can be enabled later).
+Uses percentile-based labelling so BUY/SELL classes are always
+present in training data regardless of dataset size or TP/SL settings.
 """
 import os
 import pickle
@@ -26,35 +26,54 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-MODEL_PATH  = "models/lgbm_model.pkl"
-SCALER_PATH = "models/scaler.pkl"
-FORWARD_CANDLES = 5   # Predict outcome over next 5 candles
+MODEL_PATH      = "models/lgbm_model.pkl"
+SCALER_PATH     = "models/scaler.pkl"
+FORWARD_CANDLES = 10   # Look ahead 10 candles
 
 
 def _label(df: pd.DataFrame) -> pd.Series:
     """
-    Generate forward-looking labels.
-    +1 if max future return > take_profit_pct
-    -1 if min future return < -stop_loss_pct
-    0  otherwise (no strong signal)
+    Percentile-based forward-looking labels.
+
+    For each candle, compute a net forward score:
+        score = max_return_over_next_N + min_return_over_next_N
+
+    High score = good opportunity (price went up, didn't dip much)
+    Low score  = bad window (price dropped hard)
+
+    Top 25% scores -> BUY  (+1)
+    Bottom 25%     -> SELL (-1)
+    Middle 50%     -> HOLD (0)
+
+    This guarantees all 3 classes exist in every training batch.
     """
-    tp = settings.TAKE_PROFIT_PCT / 100
-    sl = settings.STOP_LOSS_PCT   / 100
     close = df["close"]
-    labels = []
+    scores = []
+
     for i in range(len(close)):
         if i + FORWARD_CANDLES >= len(close):
-            labels.append(0)
+            scores.append(np.nan)
             continue
         future  = close.iloc[i+1 : i+1+FORWARD_CANDLES]
         max_ret = (future.max() - close.iloc[i]) / close.iloc[i]
         min_ret = (future.min() - close.iloc[i]) / close.iloc[i]
-        if max_ret >= tp:
+        scores.append(max_ret + min_ret)
+
+    score_series = pd.Series(scores, index=df.index)
+    buy_thresh   = score_series.quantile(0.75)
+    sell_thresh  = score_series.quantile(0.25)
+
+    labels = []
+    for score in scores:
+        if pd.isna(score):
+            labels.append(0)
+        elif score >= buy_thresh:
             labels.append(1)
-        elif min_ret <= -sl:
+        elif score <= sell_thresh:
             labels.append(-1)
         else:
             labels.append(0)
+
     return pd.Series(labels, index=df.index)
 
 
@@ -65,7 +84,7 @@ class MLStrategy:
         self._candles_since_train = 0
         self._load_if_exists()
 
-    # ── Persistence ──────────────────────────────────────────────────────────
+    # Persistence
     def _save(self):
         os.makedirs("models", exist_ok=True)
         with open(MODEL_PATH, "wb")  as f: pickle.dump(self.model,  f)
@@ -78,21 +97,24 @@ class MLStrategy:
             with open(SCALER_PATH, "rb") as f: self.scaler = pickle.load(f)
             log.info("Loaded existing model from disk.")
 
-    # ── Training ─────────────────────────────────────────────────────────────
+    # Training
     def train(self, df_raw: pd.DataFrame) -> None:
-        """Train (or retrain) the LightGBM model on historical data."""
-        log.info(f"Training on {len(df_raw)} candles …")
+        log.info(f"Training on {len(df_raw)} candles ...")
         df = compute_features(df_raw)
         df["label"] = _label(df)
 
         X = df[FEATURE_COLS].values
         y = df["label"].values
+        y_mapped = y + 1   # -1->0, 0->1, 1->2
 
-        # Map -1/0/1 → 0/1/2 for LightGBM multiclass
-        y_mapped = y + 1   # -1→0, 0→1, 1→2
+        unique_classes = np.unique(y_mapped)
+        log.info(f"Label distribution: SELL={int(np.sum(y==-1))} HOLD={int(np.sum(y==0))} BUY={int(np.sum(y==1))}")
 
-        # Time-series cross-val (no shuffle)
-        tscv = TimeSeriesSplit(n_splits=3)
+        if len(unique_classes) < 2:
+            log.warning("Not enough label diversity to train — skipping.")
+            return
+
+        tscv     = TimeSeriesSplit(n_splits=3)
         X_scaled = self.scaler.fit_transform(X)
 
         self.model = lgb.LGBMClassifier(
@@ -107,13 +129,11 @@ class MLStrategy:
             random_state=42,
             verbose=-1,
         )
-        # Final fit on all data (CV used for eval only)
         self.model.fit(X_scaled, y_mapped)
 
-        # Quick report on last fold
         for train_idx, val_idx in tscv.split(X_scaled):
-            pass   # iterate to get last fold
-        val_pred = self.model.predict(X_scaled[val_idx])
+            pass
+        val_pred       = self.model.predict(X_scaled[val_idx])
         present_labels = sorted(set(y_mapped[val_idx]) | set(val_pred))
         label_names    = {0: "SELL", 1: "HOLD", 2: "BUY"}
         log.info("\n" + classification_report(
@@ -125,13 +145,8 @@ class MLStrategy:
         self._save()
         self._candles_since_train = 0
 
-    # ── Inference ─────────────────────────────────────────────────────────────
+    # Inference
     def predict(self, df_raw: pd.DataFrame) -> tuple[str, float]:
-        """
-        Returns (signal, confidence) where:
-          signal     : 'BUY' | 'SELL' | 'HOLD'
-          confidence : probability of the predicted class (0–1)
-        """
         if self.model is None:
             log.warning("Model not trained yet — returning HOLD")
             return "HOLD", 0.0
@@ -143,19 +158,26 @@ class MLStrategy:
         last = df[FEATURE_COLS].iloc[[-1]].values
         X_sc = self.scaler.transform(last)
 
-        proba  = self.model.predict_proba(X_sc)[0]   # [p_sell, p_hold, p_buy]
-        cls_id = int(np.argmax(proba))
-        conf   = float(proba[cls_id])
+        proba     = self.model.predict_proba(X_sc)[0]
+        n_classes = len(proba)
 
+        if n_classes == 3:
+            p_sell, p_hold, p_buy = proba
+        elif n_classes == 2:
+            p_sell, p_hold, p_buy = proba[0], proba[1], 0.0
+        else:
+            p_sell, p_hold, p_buy = 0.0, 1.0, 0.0
+
+        cls_id     = int(np.argmax([p_sell, p_hold, p_buy]))
+        conf       = float(max(p_sell, p_hold, p_buy))
         signal_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
-        signal = signal_map[cls_id]
+        signal     = signal_map[cls_id]
 
         log.info(f"Signal: {signal} | Confidence: {conf:.2%} "
-                 f"[sell={proba[0]:.2f} hold={proba[1]:.2f} buy={proba[2]:.2f}]")
+                 f"[sell={p_sell:.2f} hold={p_hold:.2f} buy={p_buy:.2f}]")
         return signal, conf
 
     def on_new_candle(self, df_raw: pd.DataFrame) -> None:
-        """Call this each time a new candle closes to trigger periodic retraining."""
         self._candles_since_train += 1
         if self._candles_since_train >= settings.RETRAIN_EVERY_N:
             self.train(df_raw)

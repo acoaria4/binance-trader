@@ -2,6 +2,7 @@
 .env
 credentials/
 initial_extraction/
+old_env/
 
 # ─── ML Models & Scalers ────────────────────────────────────────────────────
 models/
