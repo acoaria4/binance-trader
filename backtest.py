@@ -59,16 +59,26 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
 
         price = row["close"]
 
-        # ── Exit logic ────────────────────────────────────────────────────────
+        # ── Exit logic with trailing stop ─────────────────────────────────────
         if in_trade:
-            sl = entry_p * (1 - settings.STOP_LOSS_PCT   / 100)
             tp = entry_p * (1 + settings.TAKE_PROFIT_PCT / 100)
+
+            # Update trailing stop
+            if price > highest_price:
+                highest_price = price
+            gain_pct = (highest_price - entry_p) / entry_p * 100
+            if gain_pct >= 1.0:   # Activate trailing after 1% gain
+                trail_sl = highest_price * (1 - settings.STOP_LOSS_PCT / 100)
+                if trail_sl > current_sl:
+                    current_sl = trail_sl
+
             reason = None
-            if price <= sl:   reason = "SL"
-            elif price >= tp: reason = "TP"
+            if price >= tp:          reason = "TP"
+            elif price <= current_sl: reason = "SL"
 
             if reason is None:
                 signal, conf = strat.predict(window)
+                signal_counts[signal] = signal_counts.get(signal, 0) + 1
                 if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
                     reason = "SIGNAL"
 
@@ -99,8 +109,10 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
                 skipped_conf += 1
             continue
 
-        entry_p  = price
-        in_trade = True
+        entry_p      = price
+        current_sl   = price * (1 - settings.STOP_LOSS_PCT / 100)
+        highest_price = price
+        in_trade     = True
         trades.append({"ts": ts, "action": "BUY", "price": price, "conf": conf})
 
     # ── Summary ───────────────────────────────────────────────────────────────
