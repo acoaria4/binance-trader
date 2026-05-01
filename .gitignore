@@ -1,0 +1,36 @@
+# ─── Secrets & Credentials ──────────────────────────────────────────────────
+.env
+credentials/
+initial_extraction/
+
+# ─── ML Models & Scalers ────────────────────────────────────────────────────
+models/
+
+# ─── Logs & Trade Data ──────────────────────────────────────────────────────
+logs/
+*.log
+*.csv
+
+# ─── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ─── Data Cache ─────────────────────────────────────────────────────────────
+data/
+
+# ─── OS & Editor ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
