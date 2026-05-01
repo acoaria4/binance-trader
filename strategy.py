@@ -118,13 +118,15 @@ class MLStrategy:
         X_scaled = self.scaler.fit_transform(X)
 
         self.model = lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=31,
-            max_depth=6,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=200,
+            learning_rate=0.03,      # Slower learning = less overfitting
+            num_leaves=16,           # Reduced from 31 = simpler trees
+            max_depth=4,             # Shallower = less memorisation
+            min_child_samples=50,    # Raised from 20 = needs more samples per leaf
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,           # L1 regularisation
+            reg_lambda=0.1,          # L2 regularisation
             class_weight="balanced",
             random_state=42,
             verbose=-1,
@@ -152,7 +154,9 @@ class MLStrategy:
             return "HOLD", 0.0
 
         df = compute_features(df_raw)
-        if df.empty:
+        if df.empty or len(df) < 5:
+            # Window too small after dropna — extend lookback in caller
+            log.debug(f"predict(): empty features after dropna (window={len(df_raw)} rows)")
             return "HOLD", 0.0
 
         last = df[FEATURE_COLS].iloc[[-1]].values

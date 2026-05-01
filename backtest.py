@@ -44,13 +44,17 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
     entry_p    = 0.0
     skipped_regime   = 0
     skipped_conf     = 0
+    signal_counts    = {}
+
+    # Use RAW ohlcv for windows so compute_features runs inside predict()
+    # Need 250+ candles so EMA200 + dropna leaves usable rows
+    MIN_WINDOW   = 250
+    test_start_raw = len(df_raw) - len(df_test)
 
     for i, (ts, row) in enumerate(df_test.iterrows()):
-        if i < 1:
-            continue
-
-        window = df_test.iloc[max(0, i - settings.LOOKBACK_CANDLES):i]
-        if len(window) < 52:
+        abs_i  = test_start_raw + i
+        window = df_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WINDOW)):abs_i]
+        if len(window) < MIN_WINDOW:
             continue
 
         price = row["close"]
@@ -80,14 +84,16 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
             continue
 
         # ── Entry logic ───────────────────────────────────────────────────────
-        # Fix 1: Regime filter — only trade when trending
-        if settings.REQUIRE_TREND and not is_trending(window, settings.ADX_THRESHOLD):
+        # Fix 1: Regime filter — compute features first, then check regime
+        window_feat = compute_features(window)
+        if settings.REQUIRE_TREND and not is_trending(window_feat, settings.ADX_THRESHOLD):
             skipped_regime += 1
             continue
 
         signal, conf = strat.predict(window)
+        signal_counts[signal] = signal_counts.get(signal, 0) + 1
 
-        # Fix 2: Raised confidence threshold
+        # Fix 2: Confidence threshold
         if signal != "BUY" or conf < settings.MIN_SIGNAL_CONFIDENCE:
             if signal == "BUY":
                 skipped_conf += 1
@@ -122,6 +128,7 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
     print(f"  Final equity:    {capital:.2f} USDT (start: 1000)")
     print(f"  Skipped (regime):{skipped_regime}")
     print(f"  Skipped (conf):  {skipped_conf}")
+    print(f"  Signal counts:   {signal_counts}")
     print("─" * 52)
 
     # ── ASCII equity curve ─────────────────────────────────────────────────────

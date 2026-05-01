@@ -22,11 +22,12 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from exchange      import get_exchange, fetch_ohlcv, get_balance, place_market_order
+from exchange      import get_exchange, get_data_exchange, fetch_ohlcv, get_balance, place_market_order
 from strategy      import MLStrategy
 from risk          import RiskManager
 from utils.trade_logger import TradeLogger
 from utils.logger  import get_logger
+from features      import compute_features, is_trending
 from config        import settings
 
 log     = get_logger("bot")
@@ -68,7 +69,8 @@ def run():
 
     # ── Initial training ──────────────────────────────────────────────────────
     log.info("Fetching historical data for initial training …")
-    df_init = fetch_ohlcv(exchange)
+    data_exchange = get_data_exchange()
+    df_init = fetch_ohlcv(data_exchange, limit=2000)   # Use public exchange for full history
     if strategy.model is None:
         strategy.train(df_init)
 
@@ -80,7 +82,7 @@ def run():
 
     while True:
         try:
-            df = fetch_ohlcv(exchange)
+            df = fetch_ohlcv(data_exchange, limit=300)   # 300 raw candles -> ~250 after dropna
             current_price = float(df["close"].iloc[-1])
             current_ts    = df.index[-1]
 
@@ -106,7 +108,11 @@ def run():
                 last_signal, last_conf = signal, conf
 
                 # ── BUY logic ─────────────────────────────────────────────────
-                if signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                # Regime filter
+                df_feat = compute_features(df)
+                if settings.REQUIRE_TREND and not is_trending(df_feat, settings.ADX_THRESHOLD):
+                    log.info("Regime filter: market not trending — skipping BUY")
+                elif signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
                     allowed, reason = risk.can_open_trade(settings.SYMBOL)
                     if allowed:
                         balance = get_balance(exchange)

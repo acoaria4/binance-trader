@@ -48,8 +48,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["price_vs_ema200"] = (c - df["ema_200"]) / df["ema_200"]
 
     # EMA slope (momentum of the trend itself)
-    df["ema_50_slope"]  = df["ema_50"].pct_change(5)
-    df["ema_200_slope"] = df["ema_200"].pct_change(10)
+    df["ema_50_slope"]  = df["ema_50"].pct_change(5,  fill_method=None)
+    df["ema_200_slope"] = df["ema_200"].pct_change(10, fill_method=None)
 
     # ── Momentum ───────────────────────────────────────────────────────────────
     df["rsi_14"] = ta.momentum.RSIIndicator(c, window=14).rsi()
@@ -92,16 +92,16 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["candle_dir"]   = np.sign(c - df["open"])   # +1 bullish, -1 bearish
 
     # ── N-candle returns ───────────────────────────────────────────────────────
-    df["ret_1"]  = c.pct_change(1)
-    df["ret_3"]  = c.pct_change(3)
-    df["ret_5"]  = c.pct_change(5)
-    df["ret_10"] = c.pct_change(10)
+    df["ret_1"]  = c.pct_change(1,  fill_method=None)
+    df["ret_3"]  = c.pct_change(3,  fill_method=None)
+    df["ret_5"]  = c.pct_change(5,  fill_method=None)
+    df["ret_10"] = c.pct_change(10, fill_method=None)
 
     df.dropna(inplace=True)
     return df
 
 
-def is_trending(df: pd.DataFrame, adx_threshold: float = 25.0) -> bool:
+def is_trending(df: pd.DataFrame, adx_threshold: float = 20.0) -> bool:
     """
     Regime filter: returns True if the market is currently trending.
     Uses the last row of a feature-computed DataFrame.
@@ -111,11 +111,12 @@ def is_trending(df: pd.DataFrame, adx_threshold: float = 25.0) -> bool:
       - ATR ratio > 0.8 (not in a volatility collapse)
     """
     if df.empty or "adx" not in df.columns:
-        return True   # Default to allowing trades if data unavailable
+        return True
     last = df.iloc[-1]
-    adx_ok = last["adx"] > adx_threshold
-    atr_ok = last["atr_ratio"] > 0.8
-    return bool(adx_ok and atr_ok)
+    adx_ok   = last["adx"] > adx_threshold
+    ema_ok   = last["ema_align"] >= 2
+    trend_ok = abs(last["price_vs_ema200"]) > 0.01
+    return bool(adx_ok or ema_ok or trend_ok)
 
 
 FEATURE_COLS = [

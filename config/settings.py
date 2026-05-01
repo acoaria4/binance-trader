@@ -22,10 +22,10 @@ TAKE_PROFIT_PCT      = float(os.getenv("TAKE_PROFIT_PCT", 5.0))  # Widened:   4.
 # ML
 LOOKBACK_CANDLES         = int(os.getenv("LOOKBACK_CANDLES", 200))
 RETRAIN_EVERY_N          = int(os.getenv("RETRAIN_EVERY_N", 50))
-MIN_SIGNAL_CONFIDENCE    = float(os.getenv("MIN_SIGNAL_CONFIDENCE", 0.72))  # Raised: 0.60 -> 0.72
+MIN_SIGNAL_CONFIDENCE    = float(os.getenv("MIN_SIGNAL_CONFIDENCE", 0.62))  # Balanced: high enough to filter noise, low enough to trade
 
 # Regime filter
-ADX_THRESHOLD            = float(os.getenv("ADX_THRESHOLD", 25.0))  # Min ADX to allow trades
+ADX_THRESHOLD            = float(os.getenv("ADX_THRESHOLD", 20.0))  # Min ADX to allow trades
 REQUIRE_TREND            = os.getenv("REQUIRE_TREND", "true").lower() == "true"
 
 # Logging
