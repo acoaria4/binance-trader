@@ -2,15 +2,13 @@
 bot.py
 Main trading bot loop.
 
+v2 improvements:
+  1. Trailing stop-loss via updated RiskManager
+  2. Retraining uses public data exchange (full history, not testnet-limited)
+  3. SELL signal exits open positions when confidence >= threshold
+
 Run with:
     python bot.py
-
-The bot will:
-  1. Connect to Binance Testnet
-  2. Fetch historical candles and train the ML model
-  3. Every new candle close → predict signal → execute trade if confident
-  4. Monitor open positions for stop-loss / take-profit exits
-  5. Log every action to CSV
 
 Press Ctrl+C to stop cleanly.
 """
@@ -22,16 +20,18 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from exchange      import get_exchange, get_data_exchange, fetch_ohlcv, get_balance, place_market_order
-from strategy      import MLStrategy
-from risk          import RiskManager
+from exchange           import get_exchange, get_data_exchange, fetch_ohlcv, get_balance, place_market_order
+from strategy           import MLStrategy
+from risk               import RiskManager
 from utils.trade_logger import TradeLogger
-from utils.logger  import get_logger
-from features      import compute_features, is_trending
-from config        import settings
+from utils.logger       import get_logger
+from features           import compute_features, is_trending
+from config             import settings
 
 log     = get_logger("bot")
 console = Console()
+
+DATA_FETCH_LIMIT = 300   # Raw candles per poll — gives ~250 after EMA200 dropna
 
 
 def print_banner():
@@ -39,6 +39,7 @@ def print_banner():
 [bold cyan]╔══════════════════════════════════════════╗
 ║   KEW AI Trading Bot  •  Binance Testnet ║
 ║   Strategy: LightGBM Signal Classifier   ║
+║   v2: Trailing SL + SELL exits           ║
 ╚══════════════════════════════════════════╝[/bold cyan]
 """)
 
@@ -48,115 +49,128 @@ def print_status(balance: float, n_positions: int, last_signal: str,
     table = Table(box=box.SIMPLE, show_header=False)
     table.add_column("Key",   style="dim")
     table.add_column("Value", style="bold")
-    table.add_row("Symbol",     settings.SYMBOL)
-    table.add_row("Timeframe",  settings.TIMEFRAME)
-    table.add_row("Balance",    f"{balance:.2f} USDT")
-    table.add_row("Open trades",f"{n_positions} / {settings.MAX_OPEN_TRADES}")
-    table.add_row("Last price", f"{last_price:.2f}")
-    table.add_row("Signal",     last_signal)
-    table.add_row("Confidence", f"{last_conf:.1%}")
-    table.add_row("Time (UTC)", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    table.add_row("Symbol",      settings.SYMBOL)
+    table.add_row("Timeframe",   settings.TIMEFRAME)
+    table.add_row("Balance",     f"{balance:.2f} USDT")
+    table.add_row("Open trades", f"{n_positions} / {settings.MAX_OPEN_TRADES}")
+    table.add_row("Last price",  f"{last_price:.2f}")
+    table.add_row("Signal",      last_signal)
+    table.add_row("Confidence",  f"{last_conf:.1%}")
+    table.add_row("Time (UTC)",  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     console.print(table)
 
 
 def run():
     print_banner()
 
-    exchange     = get_exchange()
-    strategy     = MLStrategy()
-    risk         = RiskManager()
-    trade_logger = TradeLogger()
+    trade_exchange = get_exchange()       # Testnet — for order execution only
+    data_exchange  = get_data_exchange()  # Live public — for all data fetching
+    strategy       = MLStrategy()
+    risk           = RiskManager()
+    trade_logger   = TradeLogger()
 
     # ── Initial training ──────────────────────────────────────────────────────
     log.info("Fetching historical data for initial training …")
-    data_exchange = get_data_exchange()
-    df_init = fetch_ohlcv(data_exchange, limit=2000)   # Use public exchange for full history
+    df_init = fetch_ohlcv(data_exchange, limit=2000)
     if strategy.model is None:
         strategy.train(df_init)
 
-    last_signal  = "—"
-    last_conf    = 0.0
-    last_candle  = None   # track last closed candle timestamp
+    last_signal = "—"
+    last_conf   = 0.0
+    last_candle = None
 
     log.info("Bot live. Entering main loop. Press Ctrl+C to stop.")
 
     while True:
         try:
-            df = fetch_ohlcv(data_exchange, limit=300)   # 300 raw candles -> ~250 after dropna
+            # ── Fetch latest candles from public exchange ─────────────────────
+            df            = fetch_ohlcv(data_exchange, limit=DATA_FETCH_LIMIT)
             current_price = float(df["close"].iloc[-1])
             current_ts    = df.index[-1]
 
-            # ── Exit checks (every tick) ──────────────────────────────────────
+            # ── Trailing stop + exit checks (every tick) ──────────────────────
             exits = risk.check_exits(current_price)
             for pos, reason in exits:
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
-                place_market_order(exchange, pos.symbol, "sell", pos.quantity * current_price)
+                pnl_pct = pos.pnl_pct(current_price)
+                place_market_order(trade_exchange, pos.symbol, "sell",
+                                   pos.quantity * current_price)
                 risk.close_position(pos.symbol)
                 trade_logger.log_trade(
                     symbol=pos.symbol, action=f"SELL_{reason.upper()}",
                     price=current_price, quantity=pos.quantity,
                     reason=reason, pnl_pct=pnl_pct,
                 )
+                log.info(f"Exit: {reason.upper()} | PnL: {pnl_pct:+.2f}%")
 
-            # ── New candle check ──────────────────────────────────────────────
+            # ── New candle logic ──────────────────────────────────────────────
             if last_candle is None or current_ts != last_candle:
                 last_candle = current_ts
-                log.info(f"New candle closed: {current_ts} @ {current_price:.2f}")
+                log.info(f"New candle: {current_ts} @ {current_price:.2f}")
 
-                strategy.on_new_candle(df)       # triggers retrain if due
+                # Fix 2: Retrain using public data exchange (full history)
+                if strategy._candles_since_train >= settings.RETRAIN_EVERY_N:
+                    df_retrain = fetch_ohlcv(data_exchange, limit=2000)
+                    strategy.train(df_retrain)
+                else:
+                    strategy._candles_since_train += 1
+
                 signal, conf = strategy.predict(df)
                 last_signal, last_conf = signal, conf
 
-                # ── BUY logic ─────────────────────────────────────────────────
-                # Regime filter
-                df_feat = compute_features(df)
-                if settings.REQUIRE_TREND and not is_trending(df_feat, settings.ADX_THRESHOLD):
-                    log.info("Regime filter: market not trending — skipping BUY")
-                elif signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-                    allowed, reason = risk.can_open_trade(settings.SYMBOL)
-                    if allowed:
-                        balance = get_balance(exchange)
-                        sizing  = risk.calculate_position(current_price, balance)
-                        order   = place_market_order(
-                            exchange, settings.SYMBOL, "buy",
-                            settings.TRADE_AMOUNT_USDT
-                        )
-                        risk.open_position(
-                            symbol=settings.SYMBOL,
-                            entry_price=current_price,
-                            quantity=sizing["qty"],
-                            order_id=order.get("id"),
-                        )
-                        trade_logger.log_trade(
-                            symbol=settings.SYMBOL, action="BUY",
-                            price=current_price, quantity=sizing["qty"],
-                            signal_confidence=conf, reason="ml_signal",
-                        )
-                    else:
-                        log.info(f"BUY blocked: {reason}")
+                # ── Regime filter ─────────────────────────────────────────────
+                df_feat   = compute_features(df)
+                trending  = not settings.REQUIRE_TREND or \
+                            is_trending(df_feat, settings.ADX_THRESHOLD)
 
-                # ── SELL signal (optional long-exit) ──────────────────────────
-                elif signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                # Fix 3: SELL signal exits open positions ──────────────────────
+                if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
                     for pos in list(risk.open_positions):
                         if pos.symbol == settings.SYMBOL:
-                            pnl = (current_price - pos.entry_price) / pos.entry_price * 100
-                            place_market_order(exchange, pos.symbol, "sell",
+                            pnl = pos.pnl_pct(current_price)
+                            place_market_order(trade_exchange, pos.symbol, "sell",
                                                pos.quantity * current_price)
                             risk.close_position(pos.symbol)
                             trade_logger.log_trade(
                                 symbol=pos.symbol, action="SELL_SIGNAL",
                                 price=current_price, quantity=pos.quantity,
-                                signal_confidence=conf, reason="ml_sell_signal",
-                                pnl_pct=pnl,
+                                signal_confidence=conf,
+                                reason="ml_sell_signal", pnl_pct=pnl,
                             )
+                            log.info(f"SELL signal exit | PnL: {pnl:+.2f}%")
+
+                # ── BUY logic ─────────────────────────────────────────────────
+                elif signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                    if not trending:
+                        log.info("Regime filter: not trending — BUY skipped")
+                    else:
+                        allowed, block_reason = risk.can_open_trade(settings.SYMBOL)
+                        if allowed:
+                            balance = get_balance(trade_exchange)
+                            sizing  = risk.calculate_position(current_price, balance)
+                            order   = place_market_order(
+                                trade_exchange, settings.SYMBOL, "buy",
+                                settings.TRADE_AMOUNT_USDT,
+                            )
+                            risk.open_position(
+                                symbol=settings.SYMBOL,
+                                entry_price=current_price,
+                                quantity=sizing["qty"],
+                                order_id=order.get("id"),
+                            )
+                            trade_logger.log_trade(
+                                symbol=settings.SYMBOL, action="BUY",
+                                price=current_price, quantity=sizing["qty"],
+                                signal_confidence=conf, reason="ml_signal",
+                            )
+                        else:
+                            log.info(f"BUY blocked: {block_reason}")
 
             # ── Status display ────────────────────────────────────────────────
-            balance = get_balance(exchange)
+            balance = get_balance(trade_exchange)
             print_status(balance, len(risk.open_positions),
                          last_signal, last_conf, current_price)
             console.print(risk.summary())
 
-            # Wait before next poll (30s — adapt to timeframe)
             time.sleep(30)
 
         except KeyboardInterrupt:
@@ -164,7 +178,7 @@ def run():
             sys.exit(0)
         except Exception as e:
             log.error(f"Error in main loop: {e}", exc_info=True)
-            time.sleep(60)   # back-off on error
+            time.sleep(60)
 
 
 if __name__ == "__main__":
