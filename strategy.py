@@ -114,9 +114,12 @@ class MLStrategy:
         for train_idx, val_idx in tscv.split(X_scaled):
             pass   # iterate to get last fold
         val_pred = self.model.predict(X_scaled[val_idx])
+        present_labels = sorted(set(y_mapped[val_idx]) | set(val_pred))
+        label_names    = {0: "SELL", 1: "HOLD", 2: "BUY"}
         log.info("\n" + classification_report(
             y_mapped[val_idx], val_pred,
-            target_names=["SELL", "HOLD", "BUY"],
+            labels=present_labels,
+            target_names=[label_names[l] for l in present_labels],
             zero_division=0,
         ))
         self._save()
