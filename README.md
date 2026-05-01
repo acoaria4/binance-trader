@@ -1,4 +1,4 @@
-# KEW AI Trading Bot — Binance Testnet
+# AI Trading Bot — Binance Testnet
 
 An AI/ML-powered crypto trading bot using LightGBM signal classification,
 connected to Binance Testnet via `ccxt`.
