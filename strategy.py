@@ -1,46 +1,24 @@
 """
-strategy_tft.py
-Temporal Fusion Transformer (TFT) Strategy Engine.
+strategy.py
+Temporal Fusion Transformer — pure PyTorch implementation.
+No pytorch-forecasting or neuralforecast dependencies.
 
-Replaces LightGBM with a proper time series deep learning model.
+Works on Python 3.13 with just:
+    pip install torch numpy pandas scikit-learn
 
-Key advantages over LightGBM:
-  - Understands temporal order and long-range dependencies
-  - Multi-horizon forecasting (predicts next 1, 3, 5, 10 candles)
-  - Attention mechanism shows WHICH past candles influenced the decision
-  - Uncertainty quantification — knows when it doesn't know
-  - Handles multiple assets/symbols as covariates
-
-Architecture:
-  - Variable Selection Networks (VSN) — learns which features matter
-  - Gated Residual Networks (GRN) — non-linear feature processing
-  - LSTM encoder/decoder — captures temporal dynamics
-  - Multi-head attention — long-range pattern recognition
-  - Quantile output heads — probabilistic predictions
-
-Uses PyTorch + PyTorch Forecasting library.
-
-Install:
-  pip install pytorch-forecasting pytorch-lightning torch
+Architecture follows Lim et al. (2021) "Temporal Fusion Transformers
+for Interpretable Multi-horizon Time Series Forecasting"
 """
 import os
+import math
 import pickle
-import warnings
 import numpy as np
 import pandas as pd
-from pathlib import Path
-
-warnings.filterwarnings("ignore")
-
-try:
-    import torch
-    import pytorch_lightning as pl
-    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-    from pytorch_forecasting.data import GroupNormalizer
-    from pytorch_forecasting.metrics import QuantileLoss
-    TFT_AVAILABLE = True
-except ImportError:
-    TFT_AVAILABLE = False
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
 
 from features import FEATURE_COLS, compute_features
 from config import settings
@@ -48,251 +26,274 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-MODEL_PATH   = "models/tft_model.ckpt"
-SCALER_PATH  = "models/tft_scaler.pkl"
+MODEL_PATH  = "models/tft_pure.pt"
+SCALER_PATH = "models/tft_scaler.pkl"
 
-# TFT hyperparameters
-MAX_ENCODER_LENGTH  = 72    # Look back 72 candles (3 days on 1h)
-MAX_PREDICTION_LENGTH = 10  # Predict next 10 candles
-HIDDEN_SIZE         = 64    # Model width
-ATTENTION_HEAD_SIZE = 4
-DROPOUT             = 0.1
-HIDDEN_CONT_SIZE    = 32
-BATCH_SIZE          = 64
-MAX_EPOCHS          = 30
-LEARNING_RATE       = 0.001
-
-# Quantile targets — we predict the distribution, not just a point
-QUANTILES = [0.1, 0.25, 0.5, 0.75, 0.9]
+# Hyperparameters
+SEQ_LEN     = 48    # Input sequence length
+HORIZON     = 10    # Forecast horizon
+HIDDEN      = 64    # Hidden dimension
+N_HEADS     = 4     # Attention heads
+DROPOUT     = 0.1
+BATCH_SIZE  = 64
+EPOCHS      = 60
+LR          = 1e-3
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def prepare_tft_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+# ── Label generation ──────────────────────────────────────────────────────────
+def make_labels(df: pd.DataFrame) -> pd.Series:
+    """Percentile-based labels over HORIZON candles."""
+    close = df["close"]
+    scores = []
+    for i in range(len(close)):
+        if i + HORIZON >= len(close):
+            scores.append(np.nan)
+            continue
+        fut     = close.iloc[i+1:i+1+HORIZON]
+        max_ret = (fut.max() - close.iloc[i]) / close.iloc[i]
+        min_ret = (fut.min() - close.iloc[i]) / close.iloc[i]
+        scores.append(max_ret + min_ret)
+    s = pd.Series(scores, index=df.index)
+    buy_t  = s.quantile(0.75)
+    sell_t = s.quantile(0.25)
+    labels = []
+    for v in scores:
+        if pd.isna(v):       labels.append(1)   # HOLD
+        elif v >= buy_t:     labels.append(2)   # BUY
+        elif v <= sell_t:    labels.append(0)   # SELL
+        else:                labels.append(1)   # HOLD
+    return pd.Series(labels, index=df.index)
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+def make_sequences(features: np.ndarray, labels: np.ndarray):
+    X, y = [], []
+    for i in range(SEQ_LEN, len(features)):
+        X.append(features[i-SEQ_LEN:i])
+        y.append(labels[i])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
+
+
+# ── TFT Model ─────────────────────────────────────────────────────────────────
+class GRN(nn.Module):
+    """Gated Residual Network — core TFT building block."""
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.fc1  = nn.Linear(d_model, d_model)
+        self.fc2  = nn.Linear(d_model, d_model)
+        self.gate = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+        self.elu  = nn.ELU()
+        self.sig  = nn.Sigmoid()
+
+    def forward(self, x):
+        h = self.elu(self.fc1(x))
+        h = self.drop(self.fc2(h))
+        g = self.sig(self.gate(x))
+        return self.norm(x + g * h)
+
+
+class TFTClassifier(nn.Module):
     """
-    Transform OHLCV + features DataFrame into TFT-compatible format.
-
-    TFT requires:
-      - time_idx: integer time index (0, 1, 2, ...)
-      - group_id: series identifier (symbol name)
-      - target: what to predict (future return)
-      - known_reals: features known in the future (time features)
-      - unknown_reals: features only known up to current time
+    Simplified TFT for classification.
+    Input:  (batch, seq_len, n_features)
+    Output: (batch, 3)  — logits for SELL/HOLD/BUY
     """
-    df = df.copy()
+    def __init__(self, n_features: int, hidden: int = HIDDEN,
+                 n_heads: int = N_HEADS, dropout: float = DROPOUT):
+        super().__init__()
 
-    # Integer time index required by TFT
-    df["time_idx"] = np.arange(len(df))
+        # Variable selection network
+        self.vsn = nn.Sequential(
+            nn.Linear(n_features, hidden),
+            nn.ELU(),
+            nn.Dropout(dropout),
+        )
 
-    # Group identifier (can extend to multi-asset later)
-    df["symbol"] = settings.SYMBOL.replace("/", "_")
+        # LSTM encoder
+        self.lstm = nn.LSTM(
+            input_size=hidden,
+            hidden_size=hidden,
+            num_layers=2,
+            batch_first=True,
+            dropout=dropout,
+        )
 
-    # Target: forward 1-candle return (what we want to predict)
-    df["target"] = df["close"].pct_change(1).shift(-1)
+        # GRN after LSTM
+        self.grn = GRN(hidden, dropout)
 
-    # Time-based known features (cyclic encoding)
-    if hasattr(df.index, 'hour'):
-        df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
-        df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
-        df["dow_sin"]  = np.sin(2 * np.pi * df.index.dayofweek / 7)
-        df["dow_cos"]  = np.cos(2 * np.pi * df.index.dayofweek / 7)
-    else:
-        df["hour_sin"] = df["dow_sin"] = df["hour_cos"] = df["dow_cos"] = 0.0
+        # Multi-head self-attention
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(hidden)
 
-    df.dropna(inplace=True)
-    return df
+        # Output GRN + classifier
+        self.out_grn = GRN(hidden, dropout)
+        self.pool    = nn.AdaptiveAvgPool1d(1)
+        self.head    = nn.Linear(hidden, 3)
 
-
-def build_dataset(df: pd.DataFrame, training: bool = True):
-    """Build PyTorch Forecasting TimeSeriesDataSet."""
-    known_reals    = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "time_idx"]
-    unknown_reals  = [f for f in FEATURE_COLS if f in df.columns]
-
-    max_idx = df["time_idx"].max()
-    cutoff  = max_idx - MAX_PREDICTION_LENGTH
-
-    dataset = TimeSeriesDataSet(
-        df[df["time_idx"] <= cutoff] if training else df,
-        time_idx="time_idx",
-        target="target",
-        group_ids=["symbol"],
-        min_encoder_length=MAX_ENCODER_LENGTH // 2,
-        max_encoder_length=MAX_ENCODER_LENGTH,
-        min_prediction_length=1,
-        max_prediction_length=MAX_PREDICTION_LENGTH,
-        static_categoricals=["symbol"],
-        time_varying_known_reals=known_reals,
-        time_varying_unknown_reals=unknown_reals,
-        target_normalizer=GroupNormalizer(groups=["symbol"], transformation="softplus"),
-        add_relative_time_idx=True,
-        add_target_scales=True,
-        add_encoder_length=True,
-    )
-    return dataset
+    def forward(self, x):
+        # x: (B, T, F)
+        h = self.vsn(x)                          # (B, T, H)
+        h, _ = self.lstm(h)                      # (B, T, H)
+        h = self.grn(h)                          # (B, T, H)
+        attn_out, _ = self.attn(h, h, h)        # (B, T, H)
+        h = self.attn_norm(h + attn_out)         # residual
+        h = self.out_grn(h)                      # (B, T, H)
+        h = h.permute(0, 2, 1)                   # (B, H, T)
+        h = self.pool(h).squeeze(-1)             # (B, H)
+        return self.head(h)                      # (B, 3)
 
 
+# ── Strategy class ────────────────────────────────────────────────────────────
 class TFTStrategy:
-    """
-    Temporal Fusion Transformer trading strategy.
-
-    Drop-in replacement for MLStrategy — same interface:
-      - train(df_raw)
-      - predict(df_raw) -> (signal, confidence)
-      - on_new_candle(df_raw)
-    """
-
     def __init__(self):
-        self.model  = None
-        self.dataset_params = None
+        self.model   = None
+        self.scaler  = StandardScaler()
+        self.fitted  = False
         self._candles_since_train = 0
+        self._load_if_exists()
 
-        if not TFT_AVAILABLE:
-            log.warning(
-                "PyTorch Forecasting not installed. "
-                "Run: pip install pytorch-forecasting pytorch-lightning torch\n"
-                "Falling back to LightGBM strategy."
-            )
-        else:
-            self._load_if_exists()
-
-    # ── Persistence ───────────────────────────────────────────────────────────
-    def _save(self, trainer, model):
+    def _save(self):
         os.makedirs("models", exist_ok=True)
-        trainer.save_checkpoint(MODEL_PATH)
+        torch.save(self.model.state_dict(), MODEL_PATH)
         with open(SCALER_PATH, "wb") as f:
-            pickle.dump(self.dataset_params, f)
+            pickle.dump(self.scaler, f)
         log.info("TFT model saved.")
 
     def _load_if_exists(self):
         if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
             try:
-                self.model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH)
                 with open(SCALER_PATH, "rb") as f:
-                    self.dataset_params = pickle.load(f)
+                    self.scaler = pickle.load(f)
+                n_feat = len(FEATURE_COLS)
+                self.model = TFTClassifier(n_feat).to(DEVICE)
+                self.model.load_state_dict(
+                    torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+                )
+                self.model.eval()
+                self.fitted = True
                 log.info("TFT model loaded from disk.")
             except Exception as e:
-                log.warning(f"Could not load TFT model: {e}")
+                log.warning(f"Could not load TFT: {e}")
 
-    # ── Training ──────────────────────────────────────────────────────────────
     def train(self, df_raw: pd.DataFrame) -> None:
-        if not TFT_AVAILABLE:
-            log.error("Cannot train — PyTorch Forecasting not installed.")
-            return
-
         log.info(f"Training TFT on {len(df_raw)} candles …")
         df = compute_features(df_raw)
-        df = prepare_tft_dataframe(df)
+        df["label"] = make_labels(df)
+        df.dropna(inplace=True)
 
-        if len(df) < MAX_ENCODER_LENGTH * 3:
-            log.warning(f"Need at least {MAX_ENCODER_LENGTH * 3} candles. Got {len(df)}.")
-            return
+        feats  = df[FEATURE_COLS].values
+        labels = df["label"].values
 
-        # Build datasets
-        train_dataset = build_dataset(df, training=True)
-        val_dataset   = TimeSeriesDataSet.from_dataset(
-            train_dataset, df, predict=True, stop_randomization=True
+        feats_scaled = self.scaler.fit_transform(feats)
+        X, y = make_sequences(feats_scaled, labels)
+
+        split = int(len(X) * 0.8)
+        train_ds = TimeSeriesDataset(X[:split], y[:split])
+        val_ds   = TimeSeriesDataset(X[split:], y[split:])
+
+        train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+        val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2)
+
+        n_feat     = len(FEATURE_COLS)
+        self.model = TFTClassifier(n_feat).to(DEVICE)
+        optimizer  = torch.optim.Adam(self.model.parameters(), lr=LR)
+        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS
         )
-        self.dataset_params = train_dataset.get_parameters()
+        # Weighted loss — penalise missing BUY/SELL more than HOLD
+        # Since labels are balanced by percentile, equal weights work
+        # but we boost BUY weight to force the model to predict it
+        class_weights = torch.tensor([1.0, 0.5, 1.5], dtype=torch.float32).to(DEVICE)
+        criterion  = nn.CrossEntropyLoss(weight=class_weights)
 
-        train_loader = train_dataset.to_dataloader(
-            train=True, batch_size=BATCH_SIZE, num_workers=0
-        )
-        val_loader = val_dataset.to_dataloader(
-            train=False, batch_size=BATCH_SIZE * 2, num_workers=0
-        )
+        best_val_acc = 0.0
+        best_state   = None
 
-        # Build model
-        tft = TemporalFusionTransformer.from_dataset(
-            train_dataset,
-            learning_rate=LEARNING_RATE,
-            hidden_size=HIDDEN_SIZE,
-            attention_head_size=ATTENTION_HEAD_SIZE,
-            dropout=DROPOUT,
-            hidden_continuous_size=HIDDEN_CONT_SIZE,
-            loss=QuantileLoss(quantiles=QUANTILES),
-            log_interval=10,
-            reduce_on_plateau_patience=4,
-        )
+        for epoch in range(EPOCHS):
+            # Train
+            self.model.train()
+            for xb, yb in train_dl:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                optimizer.zero_grad()
+                loss = criterion(self.model(xb), yb)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+            scheduler.step()
 
-        log.info(f"TFT parameters: {tft.size() / 1e3:.1f}k")
+            # Validate
+            self.model.eval()
+            correct = total = 0
+            with torch.no_grad():
+                for xb, yb in val_dl:
+                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                    preds   = self.model(xb).argmax(dim=1)
+                    correct += (preds == yb).sum().item()
+                    total   += len(yb)
+            val_acc = correct / total if total > 0 else 0
 
-        # Train
-        trainer = pl.Trainer(
-            max_epochs=MAX_EPOCHS,
-            accelerator="cpu",
-            enable_progress_bar=True,
-            gradient_clip_val=0.1,
-            limit_train_batches=50,
-            logger=False,
-            enable_checkpointing=False,
-        )
-        trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state   = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-        self.model = tft
-        self._save(trainer, tft)
+            if (epoch + 1) % 5 == 0:
+                log.info(f"Epoch {epoch+1}/{EPOCHS} | val_acc={val_acc:.3f} | best={best_val_acc:.3f}")
+
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        self.model.eval()
+        self.fitted = True
+        self._save()
         self._candles_since_train = 0
-        log.info("TFT training complete.")
+        log.info(f"TFT training complete. Best val accuracy: {best_val_acc:.3f}")
 
-    # ── Inference ─────────────────────────────────────────────────────────────
     def predict(self, df_raw: pd.DataFrame) -> tuple[str, float]:
-        """
-        Returns (signal, confidence):
-          signal     : 'BUY' | 'SELL' | 'HOLD'
-          confidence : 0.0–1.0
-
-        Uses the median (q=0.5) prediction for direction and
-        the spread between q0.1 and q0.9 for confidence.
-        """
-        if self.model is None or not TFT_AVAILABLE:
+        if not self.fitted or self.model is None:
             return "HOLD", 0.0
-
         try:
             df = compute_features(df_raw)
-            df = prepare_tft_dataframe(df)
-
-            if len(df) < MAX_ENCODER_LENGTH:
+            if len(df) < SEQ_LEN + 5:
                 return "HOLD", 0.0
 
-            # Use last MAX_ENCODER_LENGTH rows for inference
-            df_infer = df.iloc[-MAX_ENCODER_LENGTH:].copy()
-            df_infer["time_idx"] = np.arange(len(df_infer))
+            feats = df[FEATURE_COLS].values
+            feats_scaled = self.scaler.transform(feats)
+            seq   = feats_scaled[-SEQ_LEN:]
+            x     = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-            infer_dataset = TimeSeriesDataSet.from_parameters(
-                self.dataset_params, df_infer, predict=True
-            )
-            infer_loader = infer_dataset.to_dataloader(
-                train=False, batch_size=1, num_workers=0
-            )
+            self.model.eval()
+            with torch.no_grad():
+                logits = self.model(x)
+                probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-            # Get quantile predictions
-            predictions = self.model.predict(
-                infer_loader, mode="quantiles", return_x=False
-            )
-            # predictions shape: (batch, time_steps, quantiles)
-            pred = predictions[0]  # first (only) batch
-
-            # Use 1-step ahead prediction
-            q10  = float(pred[0, 0])   # pessimistic
-            q50  = float(pred[0, 2])   # median
-            q90  = float(pred[0, 4])   # optimistic
-
-            # Direction from median
-            # Spread between q90 and q10 normalised as confidence proxy
-            spread = abs(q90 - q10)
-            conf   = min(float(spread / (abs(q50) + 1e-6 + spread)), 1.0)
-            conf   = max(conf, 0.0)
-
-            tp_thresh = settings.TAKE_PROFIT_PCT / 100 / MAX_PREDICTION_LENGTH
-            sl_thresh = settings.STOP_LOSS_PCT   / 100 / MAX_PREDICTION_LENGTH
-
-            if q50 > tp_thresh:
-                signal = "BUY"
-            elif q50 < -sl_thresh:
-                signal = "SELL"
-            else:
-                signal = "HOLD"
+            cls_id     = int(np.argmax(probs))
+            conf       = float(probs[cls_id])
+            signal_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
+            signal     = signal_map[cls_id]
 
             log.info(
-                f"TFT signal: {signal} | conf={conf:.2%} | "
-                f"q10={q10:.4f} q50={q50:.4f} q90={q90:.4f}"
+                f"TFT: {signal} | conf={conf:.2%} "
+                f"[sell={probs[0]:.2f} hold={probs[1]:.2f} buy={probs[2]:.2f}]"
             )
             return signal, conf
 

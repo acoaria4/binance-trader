@@ -1,184 +1,171 @@
 """
 backtest.py
-Train and backtest the TFT strategy on historical data.
+Walk-forward backtester with regime filter, confidence threshold,
+and improved risk/reward ratio.
 
 Usage:
-    # First fetch data:
-    python fetch_history.py --timeframe 4h --limit 10000
-
-    # Then train and backtest:
-    python backtest_tft.py --timeframe 4h
-
-The TFT is trained on 70% of data and tested on remaining 30%.
-Results are compared against LightGBM baseline.
+    python backtest.py --symbol BTC/USDT --timeframe 1h --limit 5000
 """
 import argparse
-import os
-import numpy as np
 import pandas as pd
+import numpy as np
 
-from exchange   import get_data_exchange, fetch_ohlcv
-from features   import compute_features, FEATURE_COLS, is_trending
-from legacy.strategy_lgbm import MLStrategy  # LightGBM baseline
-from strategy import TFTStrategy, prepare_tft_dataframe
-from config     import settings
+from exchange  import get_data_exchange, fetch_ohlcv
+from features  import compute_features, FEATURE_COLS, is_trending
+from strategy  import TFTStrategy
+from legacy.strategy_lgbm import MLStrategy, _label, FORWARD_CANDLES
+from config    import settings
 from utils.logger import get_logger
 
-log = get_logger("backtest_tft")
+log = get_logger("backtest")
 
 
-def run_backtest(strategy, df_raw: pd.DataFrame,
-                 label: str = "Strategy") -> dict:
-    """
-    Generic walk-forward backtest — works with any strategy
-    that implements predict(df_raw) -> (signal, confidence).
-    """
+def run_backtest(symbol: str, timeframe: str, limit: int,
+                 train_frac: float = 0.6) -> None:
+
+    exchange = get_data_exchange()
+    df_raw   = fetch_ohlcv(exchange, symbol=symbol, timeframe=timeframe, limit=limit)
     df       = compute_features(df_raw)
-    split    = int(len(df) * 0.7)
+    df["label"] = _label(df)
+
+    split    = int(len(df) * train_frac)
     df_train = df.iloc[:split]
     df_test  = df.iloc[split:]
 
-    log.info(f"[{label}] Training on {len(df_train)} candles …")
-    strategy.train(df_train)
+    log.info(f"Train candles: {len(df_train)} | Test candles: {len(df_test)}")
 
-    capital      = 1000.0
-    equity       = [capital]
-    trades       = []
-    in_trade     = False
-    entry_p      = 0.0
-    current_sl   = 0.0
-    highest_price = 0.0
+    strat = MLStrategy()
+    strat.train(df_train.drop(columns=["label"]))
+
+    # ── Walk-forward simulation ───────────────────────────────────────────────
+    capital    = 1000.0
+    equity     = [capital]
+    trades     = []
+    in_trade   = False
+    entry_p    = 0.0
+    skipped_regime   = 0
+    skipped_conf     = 0
+    signal_counts    = {}
+
+    # Use RAW ohlcv for windows so compute_features runs inside predict()
+    # Need 250+ candles so EMA200 + dropna leaves usable rows
     MIN_WINDOW   = 250
-    test_start   = len(df_raw) - len(df_test)
+    test_start_raw = len(df_raw) - len(df_test)
 
     for i, (ts, row) in enumerate(df_test.iterrows()):
-        abs_i  = test_start + i
+        abs_i  = test_start_raw + i
         window = df_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WINDOW)):abs_i]
         if len(window) < MIN_WINDOW:
             continue
 
         price = row["close"]
 
+        # ── Exit logic with trailing stop ─────────────────────────────────────
         if in_trade:
+            tp = entry_p * (1 + settings.TAKE_PROFIT_PCT / 100)
+
+            # Update trailing stop
             if price > highest_price:
                 highest_price = price
-            gain = (highest_price - entry_p) / entry_p * 100
-            if gain >= 1.0:
-                trail = highest_price * (1 - settings.STOP_LOSS_PCT / 100)
-                if trail > current_sl:
-                    current_sl = trail
+            gain_pct = (highest_price - entry_p) / entry_p * 100
+            if gain_pct >= 1.0:   # Activate trailing after 1% gain
+                trail_sl = highest_price * (1 - settings.STOP_LOSS_PCT / 100)
+                if trail_sl > current_sl:
+                    current_sl = trail_sl
 
-            tp     = entry_p * (1 + settings.TAKE_PROFIT_PCT / 100)
             reason = None
-            if price >= tp:           reason = "TP"
+            if price >= tp:          reason = "TP"
             elif price <= current_sl: reason = "SL"
-            else:
-                sig, conf = strategy.predict(window)
-                if sig == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+
+            if reason is None:
+                signal, conf = strat.predict(window)
+                signal_counts[signal] = signal_counts.get(signal, 0) + 1
+                if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
                     reason = "SIGNAL"
 
             if reason:
-                pnl     = (price - entry_p) / entry_p
-                capital *= (1 + pnl)
+                pnl_pct  = (price - entry_p) / entry_p
+                capital *= (1 + pnl_pct)
                 equity.append(capital)
-                trades.append({"action": f"SELL_{reason}", "pnl": pnl * 100})
+                trades.append({
+                    "ts": ts, "action": f"SELL_{reason}",
+                    "price": price, "pnl_pct": pnl_pct * 100,
+                })
                 in_trade = False
             continue
 
-        # Regime filter
-        wfeat = compute_features(window)
-        if settings.REQUIRE_TREND and not is_trending(wfeat, settings.ADX_THRESHOLD):
+        # ── Entry logic ───────────────────────────────────────────────────────
+        # Fix 1: Regime filter — compute features first, then check regime
+        window_feat = compute_features(window)
+        if settings.REQUIRE_TREND and not is_trending(window_feat, settings.ADX_THRESHOLD):
+            skipped_regime += 1
             continue
 
-        sig, conf = strategy.predict(window)
-        if sig != "BUY" or conf < settings.MIN_SIGNAL_CONFIDENCE:
+        signal, conf = strat.predict(window)
+        signal_counts[signal] = signal_counts.get(signal, 0) + 1
+
+        # Fix 2: Confidence threshold
+        if signal != "BUY" or conf < settings.MIN_SIGNAL_CONFIDENCE:
+            if signal == "BUY":
+                skipped_conf += 1
             continue
 
-        entry_p       = price
-        current_sl    = price * (1 - settings.STOP_LOSS_PCT / 100)
+        entry_p      = price
+        current_sl   = price * (1 - settings.STOP_LOSS_PCT / 100)
         highest_price = price
-        in_trade      = True
-        trades.append({"action": "BUY", "price": price})
+        in_trade     = True
+        trades.append({"ts": ts, "action": "BUY", "price": price, "conf": conf})
 
-    closed = [t for t in trades if "pnl" in t]
-    wins   = [t for t in closed if t["pnl"] > 0]
-    rets   = pd.Series([t["pnl"] / 100 for t in closed])
-    sharpe = (rets.mean() / rets.std() * np.sqrt(252)) if len(rets) > 1 and rets.std() > 0 else 0
-    total  = (capital - 1000) / 1000 * 100
-    mxdd   = 0.0
-    if equity:
-        peak = equity[0]
-        for v in equity:
-            if v > peak: peak = v
-            dd = (peak - v) / peak * 100
-            if dd > mxdd: mxdd = dd
+    # ── Summary ───────────────────────────────────────────────────────────────
+    closed = [t for t in trades if "pnl_pct" in t]
+    wins   = [t for t in closed if t["pnl_pct"] > 0]
+    total_return = (capital - 1000) / 1000 * 100
 
-    result = dict(
-        label=label,
-        trades=len(closed),
-        win_rate=len(wins)/len(closed)*100 if closed else 0,
-        total_return=total,
-        max_drawdown=mxdd,
-        sharpe=sharpe,
-        final_equity=capital,
-    )
+    rets   = pd.Series([t["pnl_pct"] / 100 for t in closed])
+    sharpe = (rets.mean() / rets.std() * np.sqrt(252)) if (len(rets) > 1 and rets.std() > 0) else 0
 
-    print(f"\n{'─'*52}")
-    print(f"  {label}")
-    print(f"{'─'*52}")
-    print(f"  Trades:       {result['trades']}")
-    print(f"  Win rate:     {result['win_rate']:.1f}%")
-    print(f"  Total return: {result['total_return']:+.2f}%")
-    print(f"  Max drawdown: -{result['max_drawdown']:.2f}%")
-    print(f"  Sharpe:       {result['sharpe']:.2f}")
-    print(f"  Final equity: {result['final_equity']:.2f} USDT")
-    print(f"{'─'*52}")
+    max_eq  = max(equity) if equity else 1000
+    min_eq  = min(equity) if equity else 1000
+    max_dd  = (max_eq - min_eq) / max_eq * 100
 
-    return result
+    print("\n" + "─" * 52)
+    print(f"  Backtest: {symbol} | {timeframe} | {len(df_test)} candles")
+    print(f"  Settings: SL={settings.STOP_LOSS_PCT}% | TP={settings.TAKE_PROFIT_PCT}% | "
+          f"MinConf={settings.MIN_SIGNAL_CONFIDENCE:.0%} | ADX>{settings.ADX_THRESHOLD}")
+    print("─" * 52)
+    print(f"  Trades:          {len(closed)}")
+    print(f"  Win rate:        {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate:   N/A")
+    print(f"  Total return:    {total_return:+.2f}%")
+    print(f"  Max drawdown:    -{max_dd:.2f}%")
+    print(f"  Sharpe:          {sharpe:.2f}")
+    print(f"  Final equity:    {capital:.2f} USDT (start: 1000)")
+    print(f"  Skipped (regime):{skipped_regime}")
+    print(f"  Skipped (conf):  {skipped_conf}")
+    print(f"  Signal counts:   {signal_counts}")
+    print("─" * 52)
+
+    # ── ASCII equity curve ─────────────────────────────────────────────────────
+    if len(equity) > 1:
+        mn, mx = min(equity), max(equity)
+        height = 8
+        rows   = []
+        step   = max(1, len(equity) // 60)
+        for row_i in range(height, 0, -1):
+            line  = ""
+            for val in equity[::step]:
+                norm = (val - mn) / (mx - mn + 1e-9)
+                line += "█" if norm >= row_i / height else " "
+            label = f"{mn + (mx-mn)*row_i/height:>8.0f}" if row_i in (1, height) else " " * 8
+            rows.append(f"  {label} │{line}")
+        print("\n  Equity curve (USDT)")
+        print("\n".join(rows))
+        print()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol",    default=settings.SYMBOL)
-    parser.add_argument("--timeframe", default="4h")
-    parser.add_argument("--limit",     default=10000, type=int)
-    parser.add_argument("--tft-only",  action="store_true")
+    parser.add_argument("--timeframe", default=settings.TIMEFRAME)
+    parser.add_argument("--limit",     default=5000, type=int)
     args = parser.parse_args()
-
-    log.info(f"Fetching {args.limit} candles [{args.timeframe}] …")
-    exchange = get_data_exchange()
-    df_raw   = fetch_ohlcv(
-        exchange, symbol=args.symbol,
-        timeframe=args.timeframe, limit=args.limit
-    )
-    log.info(f"Got {len(df_raw)} candles: {df_raw.index[0]} → {df_raw.index[-1]}")
-
-    results = []
-
-    # LightGBM baseline
-    if not args.tft_only:
-        lgbm = MLStrategy()
-        r1   = run_backtest(lgbm, df_raw.copy(), label="LightGBM (baseline)")
-        results.append(r1)
-
-    # TFT
-    try:
-        tft = TFTStrategy()
-        r2  = run_backtest(tft, df_raw.copy(), label="TFT (new)")
-        results.append(r2)
-    except Exception as e:
-        log.error(f"TFT failed: {e}")
-        log.info("Install dependencies: pip install pytorch-forecasting pytorch-lightning torch")
-
-    # Comparison
-    if len(results) == 2:
-        print("\n── Head-to-head comparison ────────────────────────")
-        metrics = ["trades", "win_rate", "total_return", "max_drawdown", "sharpe"]
-        for m in metrics:
-            v1, v2 = results[0][m], results[1][m]
-            winner = "TFT ✓" if (
-                (m in ["win_rate", "total_return", "sharpe", "trades"] and v2 > v1) or
-                (m == "max_drawdown" and v2 < v1)
-            ) else "LightGBM ✓"
-            print(f"  {m:15} LightGBM={v1:.2f}  TFT={v2:.2f}  → {winner}")
-        print()
+    run_backtest(args.symbol, args.timeframe, args.limit)
