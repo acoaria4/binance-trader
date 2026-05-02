@@ -1,5 +1,5 @@
 """
-backtest_tft.py
+backtest.py
 Train and backtest the TFT strategy on historical data.
 
 Usage:
@@ -19,8 +19,8 @@ import pandas as pd
 
 from exchange   import get_data_exchange, fetch_ohlcv
 from features   import compute_features, FEATURE_COLS, is_trending
-from strategy   import MLStrategy          # LightGBM baseline
-from strategy_tft import TFTStrategy, prepare_tft_dataframe
+from legacy.strategy_lgbm import MLStrategy  # LightGBM baseline
+from strategy import TFTStrategy, prepare_tft_dataframe
 from config     import settings
 from utils.logger import get_logger
 
