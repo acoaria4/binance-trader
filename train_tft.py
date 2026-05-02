@@ -1,12 +1,19 @@
 """
 train_tft.py
-Standalone TFT training and backtest.
-Run this independently of backtest.py.
+Train TFT on maximum available historical data.
 
-Usage:
-    python train_tft.py --timeframe 4h --limit 10000
+Two modes:
+  1. Fetch fresh + train:
+     python train_tft.py --timeframe 1h
+
+  2. Use pre-fetched saved data (recommended after fetch_all_history.py):
+     python train_tft.py --use-saved --timeframe 1h
+
+The --use-saved mode loads all CSV files from data/ folder,
+concatenates them, and trains on the full dataset.
 """
 import argparse
+import os
 import numpy as np
 import pandas as pd
 
@@ -19,31 +26,37 @@ from utils.logger import get_logger
 log = get_logger("train_tft")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol",    default=settings.SYMBOL)
-    parser.add_argument("--timeframe", default="4h")
-    parser.add_argument("--limit",     default=10000, type=int)
-    args = parser.parse_args()
+def load_saved_data(timeframe: str, symbols: list) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load pre-fetched CSVs from data/ folder.
+    Returns (df_train_combined, df_test_btc)
+    """
+    dfs = []
+    df_btc = None
 
-    # Fetch data
-    log.info(f"Fetching {args.limit} {args.timeframe} candles ...")
-    exchange = get_data_exchange()
-    df_raw   = fetch_ohlcv(exchange, symbol=args.symbol,
-                           timeframe=args.timeframe, limit=args.limit)
-    log.info(f"Got {len(df_raw)} candles: {df_raw.index[0]} to {df_raw.index[-1]}")
+    for sym in symbols:
+        clean = sym.replace("/", "_")
+        path  = f"data/{clean}_{timeframe}.csv"
+        if not os.path.exists(path):
+            log.warning(f"Missing: {path} — run fetch_all_history.py first")
+            continue
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        log.info(f"Loaded {len(df):,} rows from {path}")
+        dfs.append(df)
+        if sym == "BTC/USDT":
+            df_btc = df
 
-    # Train on 70%
-    split    = int(len(df_raw) * 0.7)
-    df_train = df_raw.iloc[:split]
-    df_test  = df_raw.iloc[split:]
+    if not dfs:
+        raise FileNotFoundError("No data files found. Run: python fetch_all_history.py")
 
-    tft = TFTStrategy()
-    tft.train(df_train)
+    df_all = pd.concat(dfs)
+    log.info(f"Combined dataset: {len(df_all):,} candles across {len(dfs)} assets")
+    return df_all, df_btc
 
-    # Backtest on remaining 30%
-    log.info(f"Backtesting on {len(df_test)} candles ...")
+
+def run_backtest(tft: TFTStrategy, df_raw: pd.DataFrame) -> None:
     df       = compute_features(df_raw)
+    split    = int(len(df) * 0.7)
     df_test  = df.iloc[split:]
 
     capital    = 1000.0
@@ -53,7 +66,7 @@ if __name__ == "__main__":
     entry_p    = 0.0
     current_sl = 0.0
     highest_p  = 0.0
-    MIN_WIN    = 100   # TFT needs SEQ_LEN=60 + buffer
+    MIN_WIN    = 100
     test_start = len(df_raw) - len(df_test)
 
     for i, (ts, row) in enumerate(df_test.iterrows()):
@@ -75,7 +88,7 @@ if __name__ == "__main__":
             elif price <= current_sl:  reason = "SL"
             else:
                 sig, conf = tft.predict(window)
-                if sig == "SELL" and conf >= 0.40:  # Lower threshold for TFT
+                if sig == "SELL" and conf >= 0.40:
                     reason = "SIGNAL"
             if reason:
                 pnl = (price - entry_p) / entry_p
@@ -89,7 +102,7 @@ if __name__ == "__main__":
         if settings.REQUIRE_TREND and not is_trending(wfeat, settings.ADX_THRESHOLD):
             continue
         sig, conf = tft.predict(window)
-        if sig == "BUY" and conf >= 0.40:  # Lower threshold for TFT
+        if sig == "BUY" and conf >= 0.40:
             entry_p    = price
             current_sl = price * (1 - settings.STOP_LOSS_PCT / 100)
             highest_p  = price
@@ -102,19 +115,58 @@ if __name__ == "__main__":
     rets   = pd.Series([t["pnl"]/100 for t in closed])
     sharpe = (rets.mean()/rets.std()*np.sqrt(252)) if len(rets)>1 and rets.std()>0 else 0
     mxdd   = 0.0
-    peak   = equity[0]
+    peak   = equity[0] if equity else 1000
     for v in equity:
         if v > peak: peak = v
         dd = (peak - v) / peak * 100
         if dd > mxdd: mxdd = dd
 
     print(f"\n{'─'*52}")
-    print(f"  TFT Backtest: {args.symbol} | {args.timeframe} | {len(df_test)} candles")
+    print(f"  TFT Backtest | {len(df_test)} test candles")
     print(f"{'─'*52}")
     print(f"  Trades:       {len(closed)}")
-    print(f"  Win rate:     {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate: N/A")
+    print(f"  Win rate:     {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate:     N/A")
     print(f"  Total return: {total:+.2f}%")
     print(f"  Max drawdown: -{mxdd:.2f}%")
     print(f"  Sharpe:       {sharpe:.2f}")
     print(f"  Final equity: {capital:.2f} USDT")
     print(f"{'─'*52}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol",     default=settings.SYMBOL)
+    parser.add_argument("--timeframe",  default="1h")
+    parser.add_argument("--limit",      default=5000, type=int)
+    parser.add_argument("--use-saved",  action="store_true",
+                        help="Load pre-fetched data from data/ folder")
+    parser.add_argument("--symbols",    default="BTC/USDT,ETH/USDT,BNB/USDT")
+    args = parser.parse_args()
+
+    if args.use_saved:
+        symbols = [s.strip() for s in args.symbols.split(",")]
+        df_train, df_btc = load_saved_data(args.timeframe, symbols)
+        df_test_raw = df_btc  # Backtest on BTC only
+    else:
+        log.info(f"Fetching {args.limit} {args.timeframe} candles ...")
+        exchange    = get_data_exchange()
+        df_raw      = fetch_ohlcv(exchange, symbol=args.symbol,
+                                  timeframe=args.timeframe, limit=args.limit)
+        log.info(f"Fetching ETH and BNB ...")
+        df_eth      = fetch_ohlcv(exchange, symbol="ETH/USDT",
+                                  timeframe=args.timeframe, limit=args.limit)
+        df_bnb      = fetch_ohlcv(exchange, symbol="BNB/USDT",
+                                  timeframe=args.timeframe, limit=args.limit)
+        df_train    = pd.concat([df_raw, df_eth, df_bnb])
+        df_test_raw = df_raw
+        log.info(f"Combined: {len(df_train):,} candles")
+
+    # Train TFT
+    tft = TFTStrategy()
+    split = int(len(df_train) * 0.7)
+    tft.train(df_train.iloc[:split])
+
+    # Backtest on BTC test set
+    log.info("Running backtest ...")
+    split_btc = int(len(df_test_raw) * 0.7)
+    run_backtest(tft, df_test_raw)
