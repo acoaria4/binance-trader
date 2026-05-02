@@ -35,3 +35,9 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# ─── Files Downloaded from Claude ────────────────────────────────────────────
+files/
+
+# ─── Legacy Files(LightGBM Engine) ────────────────────────────────────────────
+legacy/
