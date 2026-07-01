@@ -11,6 +11,8 @@ import pandas as pd
 import numpy as np
 import ta
 
+from config import settings
+
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -97,26 +99,88 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ret_5"]  = c.pct_change(5,  fill_method=None)
     df["ret_10"] = c.pct_change(10, fill_method=None)
 
+    df = _attach_mtf_features(df)
+
     df.dropna(inplace=True)
     return df
 
 
-def is_trending(df: pd.DataFrame, adx_threshold: float = 20.0) -> bool:
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    return df.resample(rule).agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
+    }).dropna()
+
+
+def _attach_mtf_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add higher-timeframe context columns forward-filled to base TF."""
+    if not settings.REQUIRE_MTF:
+        df["mtf4h_ema_align"] = 1
+        df["mtf4h_price_vs_ema200"] = 0.0
+        df["mtf4h_adx"] = 25.0
+        return df
+
+    try:
+        ohlc = df[["open", "high", "low", "close", "volume"]].copy()
+        df4 = _resample_ohlcv(ohlc, settings.MTF_TIMEFRAME)
+        c4 = df4["close"]
+        h4, l4 = df4["high"], df4["low"]
+        ema9  = ta.trend.ema_indicator(c4, window=9)
+        ema21 = ta.trend.ema_indicator(c4, window=21)
+        ema50 = ta.trend.ema_indicator(c4, window=50)
+        ema200 = ta.trend.ema_indicator(c4, window=200)
+        adx4 = ta.trend.ADXIndicator(h4, l4, c4, window=14).adx()
+
+        mtf = pd.DataFrame(index=df4.index)
+        mtf["mtf4h_ema_align"] = (
+            (ema9 > ema21).astype(int) +
+            (ema21 > ema50).astype(int) +
+            (ema50 > ema200).astype(int)
+        )
+        mtf["mtf4h_price_vs_ema200"] = (c4 - ema200) / ema200
+        mtf["mtf4h_adx"] = adx4
+        mtf = mtf.reindex(df.index, method="ffill")
+        for col in mtf.columns:
+            df[col] = mtf[col]
+    except Exception:
+        df["mtf4h_ema_align"] = 1
+        df["mtf4h_price_vs_ema200"] = 0.0
+        df["mtf4h_adx"] = 25.0
+    return df
+
+
+def is_mtf_aligned(df: pd.DataFrame) -> bool:
+    """4h timeframe must not be bearish for long entries."""
+    if df.empty or "mtf4h_ema_align" not in df.columns:
+        return True
+    last = df.iloc[-1]
+    structure_ok = last["mtf4h_ema_align"] >= settings.MTF_MIN_EMA_ALIGN
+    trend_ok = last["mtf4h_price_vs_ema200"] > settings.MTF_MIN_PRICE_VS_EMA200
+    adx_ok = last["mtf4h_adx"] > settings.MTF_MIN_ADX
+    return bool(structure_ok or trend_ok) and adx_ok
+
+
+def is_trending(df: pd.DataFrame,
+                adx_threshold: float = 20.0,
+                min_atr_ratio: float = None) -> bool:
     """
     Regime filter: returns True if the market is currently trending.
     Uses the last row of a feature-computed DataFrame.
 
-    Conditions for TRENDING (all must be true):
+    All conditions must be met:
       - ADX > adx_threshold (trend strength)
-      - ATR ratio > 0.8 (not in a volatility collapse)
+      - ATR ratio > min_atr_ratio (not in a volatility collapse)
+      - EMA alignment >= 2 OR price is >1% away from EMA200
     """
     if df.empty or "adx" not in df.columns:
         return True
+
+    atr_min = min_atr_ratio if min_atr_ratio is not None else settings.MIN_ATR_RATIO
     last = df.iloc[-1]
-    adx_ok   = last["adx"] > adx_threshold
-    ema_ok   = last["ema_align"] >= 2
-    trend_ok = abs(last["price_vs_ema200"]) > 0.01
-    return bool(adx_ok or ema_ok or trend_ok)
+    adx_ok       = last["adx"] > adx_threshold
+    atr_ok       = last["atr_ratio"] > atr_min
+    structure_ok = last["ema_align"] >= 2 or abs(last["price_vs_ema200"]) > 0.01
+    return bool(adx_ok and atr_ok and structure_ok)
 
 
 FEATURE_COLS = [
@@ -138,4 +202,6 @@ FEATURE_COLS = [
     "candle_body", "upper_shadow", "lower_shadow", "candle_dir",
     # Returns
     "ret_1", "ret_3", "ret_5", "ret_10",
+    # Multi-timeframe (4h)
+    "mtf4h_ema_align", "mtf4h_price_vs_ema200", "mtf4h_adx",
 ]
