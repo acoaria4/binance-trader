@@ -18,6 +18,7 @@ import pandas as pd
 
 from exchange  import get_data_exchange, fetch_ohlcv
 from features  import compute_features, FEATURE_COLS, is_trending
+from simulation  import LongTradeState, check_bar_exit, pnl_at_price
 from strategy  import MLStrategy
 from config    import settings
 from utils.logger import get_logger
@@ -55,68 +56,56 @@ def train_lgbm(df_train: pd.DataFrame) -> tuple:
 
 
 def run_backtest(model, scaler, df_test_raw: pd.DataFrame) -> None:
-    """Backtest the trained model on test data."""
-    df = compute_features(df_test_raw)
-    df["label"] = make_labels(df)
-    df.dropna(inplace=True)
+    """Backtest the trained model on test data using shared exit simulation."""
+    df_feat = compute_features(df_test_raw)
+    capital = 1000.0
+    equity  = [capital]
+    trades  = []
+    in_trade = False
+    trade_state = None
+    MIN_WIN = 250
+    test_start = len(df_test_raw) - len(df_feat)
 
-    capital    = 1000.0
-    equity     = [capital]
-    trades     = []
-    in_trade   = False
-    entry_p    = 0.0
-    current_sl = 0.0
-    highest_p  = 0.0
-    MIN_WIN    = 250
-    test_start = len(df_test_raw) - len(df)
-
-    for i, (ts, row) in enumerate(df.iterrows()):
-        abs_i  = test_start + i
-        window_raw = df_test_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WIN)):abs_i]
+    for i, (ts, row) in enumerate(df_feat.iterrows()):
+        abs_i = test_start + i
+        window_raw = df_test_raw.iloc[
+            max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WIN)):abs_i + 1
+        ]
         if len(window_raw) < MIN_WIN:
             continue
-        price = row["close"]
 
-        # Get features for this candle
+        raw_row = df_test_raw.iloc[abs_i]
+        bar_high  = float(raw_row["high"])
+        bar_low   = float(raw_row["low"])
+        bar_close = float(raw_row["close"])
+
         feat = row[FEATURE_COLS].values.reshape(1, -1)
-        feat_sc = scaler.transform(feat)
-        proba   = model.predict_proba(feat_sc)[0]
-        pred    = int(np.argmax(proba))
-        conf    = float(proba[pred])
-        sig_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
-        signal  = sig_map[pred]
+        proba = model.predict_proba(scaler.transform(feat))[0]
+        pred  = int(np.argmax(proba))
+        conf  = float(proba[pred])
+        signal = {0: "SELL", 1: "HOLD", 2: "BUY"}[pred]
 
-        if in_trade:
-            if price > highest_p: highest_p = price
-            gain = (highest_p - entry_p) / entry_p * 100
-            if gain >= 1.0:
-                trail = highest_p * (1 - settings.STOP_LOSS_PCT / 100)
-                if trail > current_sl: current_sl = trail
-            tp = entry_p * (1 + settings.TAKE_PROFIT_PCT / 100)
-            reason = None
-            if price >= tp:            reason = "TP"
-            elif price <= current_sl:  reason = "SL"
-            elif signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-                reason = "SIGNAL"
+        if in_trade and trade_state is not None:
+            reason, exit_px = check_bar_exit(trade_state, bar_high, bar_low)
+            if reason is None and signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                reason, exit_px = "signal", bar_close
             if reason:
-                pnl = (price - entry_p) / entry_p
+                pnl = pnl_at_price(trade_state.entry_price, exit_px)
                 capital *= (1 + pnl)
                 equity.append(capital)
                 trades.append({"pnl": pnl * 100, "reason": reason})
                 in_trade = False
+                trade_state = None
             continue
 
-        # Regime filter
         wfeat = compute_features(window_raw)
         if settings.REQUIRE_TREND and not is_trending(wfeat, settings.ADX_THRESHOLD):
             continue
 
         if signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-            entry_p    = price
-            current_sl = price * (1 - settings.STOP_LOSS_PCT / 100)
-            highest_p  = price
-            in_trade   = True
-            trades.append({"buy": price, "conf": conf})
+            in_trade = True
+            trade_state = LongTradeState.from_entry(bar_close)
+            trades.append({"buy": bar_close, "conf": conf})
 
     closed = [t for t in trades if "pnl" in t]
     wins   = [t for t in closed if t["pnl"] > 0]
@@ -131,7 +120,7 @@ def run_backtest(model, scaler, df_test_raw: pd.DataFrame) -> None:
         if dd > mxdd: mxdd = dd
 
     print(f"\n{'─'*52}")
-    print(f"  LightGBM Backtest | {len(df)} test candles")
+    print(f"  LightGBM Backtest | {len(df_feat)} test candles")
     print(f"  Settings: SL={settings.STOP_LOSS_PCT}% | TP={settings.TAKE_PROFIT_PCT}% | MinConf={settings.MIN_SIGNAL_CONFIDENCE:.0%}")
     print(f"{'─'*52}")
     print(f"  Trades:       {len(closed)}")

@@ -37,8 +37,8 @@ def print_banner():
     console.print("""
 [bold cyan]╔══════════════════════════════════════════╗
 ║   KEW AI Trading Bot  •  Binance Testnet ║
-║   Strategy: LightGBM Triple-Barrier      ║
-║   v3: Validated retrain + persistence    ║
+║   Strategy: LightGBM + Trailing Simulation ║
+║   v4: PnL validation + intrabar exits      ║
 ╚══════════════════════════════════════════╝[/bold cyan]
 """)
 
@@ -84,10 +84,12 @@ def run():
     while True:
         try:
             df            = fetch_ohlcv(data_exchange, limit=DATA_FETCH_LIMIT)
+            bar_high      = float(df["high"].iloc[-1])
+            bar_low       = float(df["low"].iloc[-1])
             current_price = float(df["close"].iloc[-1])
             current_ts    = df.index[-1]
 
-            exits = risk.check_exits(current_price)
+            exits = risk.check_exits(bar_high, bar_low)
             for pos, reason in exits:
                 pnl_pct = pos.pnl_pct(current_price)
                 place_market_sell(trade_exchange, pos.symbol, pos.quantity)

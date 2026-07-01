@@ -14,6 +14,7 @@ kew_trading_bot/
 ├── exchange.py         ← Binance Testnet connector (ccxt)
 ├── features.py         ← Technical indicator feature engineering
 ├── strategy.py         ← LightGBM ML strategy engine
+├── simulation.py       ← Shared trailing-stop + label simulation
 ├── risk.py             ← Position sizing + stop-loss/take-profit
 ├── train_lgbm.py       ← Offline training on large/multi-asset datasets
 ├── fetch_all_history.py← Bulk historical data download
@@ -80,11 +81,12 @@ Feature Engineering ────────────────────
         ▼
 LightGBM Classifier
   Predicts: BUY / HOLD / SELL
-  Triple-barrier labels (aligned with live SL/TP):
-    BUY  = take-profit hit before stop-loss within 10 candles
-    SELL = stop-loss hit before take-profit
-    HOLD = neither barrier hit in time
-  Retrain only deploys if walk-forward macro-F1 >= RETRAIN_MIN_F1
+  Labels simulate full trade path with trailing stops (intrabar high/low):
+    BUY  = profitable exit (TP or trailing lock-in)
+    SELL = stopped out at a loss
+    HOLD = no exit within forward window
+  Retrain deploys only when walk-forward validation passes:
+    macro-F1, validation return %, Sharpe, and composite score
         │
         ▼
 Regime Filter (optional, REQUIRE_TREND=true)
@@ -122,7 +124,12 @@ Binance API (full depth). Orders are placed on Binance Testnet only.
 | `TAKE_PROFIT_PCT`       | 5.0       | % above entry to take profit                 |
 | `MIN_SIGNAL_CONFIDENCE` | 0.62      | Min ML probability to act (0–1)              |
 | `RETRAIN_EVERY_N`       | 50        | Retrain model every N new candles            |
-| `RETRAIN_MIN_F1`        | 0.30      | Min walk-forward F1 to deploy a retrained model |
+| `RETRAIN_MIN_F1`        | 0.25      | Min macro-F1 on validation fold              |
+| `RETRAIN_MIN_VAL_RETURN_PCT` | 0.0  | Min simulated return % on validation fold    |
+| `RETRAIN_MIN_VAL_SHARPE` | 0.0      | Min Sharpe on validation fold                |
+| `TRAIL_ACTIVATE_PCT`    | 1.0       | Gain % before trailing stop activates        |
+| `TRAIL_DISTANCE_PCT`    | 1.5       | Trail distance below high (defaults to SL)   |
+| `FORWARD_CANDLES`       | 10        | Label / forward simulation horizon           |
 | `REQUIRE_TREND`         | true      | Skip BUY when regime filter says ranging     |
 | `ADX_THRESHOLD`         | 20.0      | Min ADX for regime filter                    |
 | `MIN_ATR_RATIO`         | 0.8       | Min ATR ratio for regime filter              |

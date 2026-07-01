@@ -12,13 +12,12 @@ from typing import Optional
 import ccxt
 
 from config import settings
+from simulation import LongTradeState, check_bar_exit
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-TRAIL_ACTIVATE_PCT = 1.0
-TRAIL_DISTANCE_PCT = float(getattr(settings, "STOP_LOSS_PCT", 1.5))
-BALANCE_TOLERANCE  = 0.90   # accept 90% of tracked qty on reconcile
+BALANCE_TOLERANCE = 0.90
 
 
 @dataclass
@@ -36,6 +35,20 @@ class Position:
 
     def __post_init__(self):
         self.highest_price = self.entry_price
+
+    def to_state(self) -> LongTradeState:
+        return LongTradeState(
+            entry_price=self.entry_price,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+            highest_price=self.highest_price,
+            trailing_active=self.trailing_active,
+        )
+
+    def apply_state(self, state: LongTradeState) -> None:
+        self.stop_loss = state.stop_loss
+        self.highest_price = state.highest_price
+        self.trailing_active = state.trailing_active
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -65,24 +78,6 @@ class Position:
             pos.highest_price = float(highest)
         return pos
 
-    def update_trailing_stop(self, current_price: float) -> None:
-        if current_price > self.highest_price:
-            self.highest_price = current_price
-
-        gain_pct = (self.highest_price - self.entry_price) / self.entry_price * 100
-        if gain_pct >= TRAIL_ACTIVATE_PCT:
-            self.trailing_active = True
-
-        if self.trailing_active:
-            new_sl = self.highest_price * (1 - TRAIL_DISTANCE_PCT / 100)
-            if new_sl > self.stop_loss:
-                old_sl = self.stop_loss
-                self.stop_loss = new_sl
-                log.info(
-                    f"Trailing SL updated: {old_sl:.2f} → {new_sl:.2f} "
-                    f"(highest={self.highest_price:.2f})"
-                )
-
     def pnl_pct(self, current_price: float) -> float:
         return (current_price - self.entry_price) / self.entry_price * 100
 
@@ -110,10 +105,6 @@ class RiskManager:
             log.warning(f"Could not load positions file: {e}")
 
     def reconcile(self, exchange: ccxt.binance, symbol: str = None) -> None:
-        """
-        Sync tracked positions with exchange balances.
-        Drops stale positions; warns on untracked holdings.
-        """
         symbol = symbol or settings.SYMBOL
         base_asset = symbol.split("/")[0]
 
@@ -189,7 +180,7 @@ class RiskManager:
         log.info(
             f"Position opened: {symbol} @ {entry_price:.2f} | "
             f"SL={sl:.2f} | TP={tp:.2f} | Trail activates at "
-            f"{entry_price * (1 + TRAIL_ACTIVATE_PCT/100):.2f}"
+            f"{entry_price * (1 + settings.TRAIL_ACTIVATE_PCT/100):.2f}"
         )
         return pos
 
@@ -202,17 +193,15 @@ class RiskManager:
                 return pos
         return None
 
-    def check_exits(self, current_price: float) -> list[tuple[Position, str]]:
+    def check_exits(self, bar_high: float, bar_low: float) -> list[tuple[Position, str]]:
+        """Check all positions for intrabar TP/SL/trailing exits."""
         exits = []
         for pos in self.open_positions:
-            pos.update_trailing_stop(current_price)
-
-            if current_price >= pos.take_profit:
-                exits.append((pos, "take_profit"))
-            elif current_price <= pos.stop_loss:
-                reason = "trailing_stop" if pos.trailing_active else "stop_loss"
+            state = pos.to_state()
+            reason, _ = check_bar_exit(state, bar_high, bar_low)
+            pos.apply_state(state)
+            if reason:
                 exits.append((pos, reason))
-
         return exits
 
     def summary(self) -> str:

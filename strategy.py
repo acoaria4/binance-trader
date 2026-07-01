@@ -1,15 +1,6 @@
 """
 strategy.py
-ML Strategy Engine: trains a LightGBM classifier that predicts
-whether a long entry would hit take-profit before stop-loss.
-
-Signal classes:
-  1 = BUY  (TP barrier hit before SL within forward window)
-  0 = HOLD (neither barrier hit in time)
- -1 = SELL (SL barrier hit before TP — avoid / exit long)
-
-Labels use the same STOP_LOSS_PCT / TAKE_PROFIT_PCT as live trading
-(triple-barrier method).
+ML Strategy Engine: LightGBM classifier trained on trailing-stop-aligned labels.
 """
 import json
 import os
@@ -21,69 +12,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, f1_score
 
-from features import FEATURE_COLS, compute_features
+from features import FEATURE_COLS, compute_features, is_trending
+from simulation import make_labels, run_trading_simulation
 from config import settings
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-MODEL_PATH      = "models/lgbm_model.pkl"
-SCALER_PATH     = "models/scaler.pkl"
-META_PATH       = "models/training_meta.json"
-FORWARD_CANDLES = 10   # Look ahead up to 10 candles for barrier hits
-
-
-def make_labels(df: pd.DataFrame,
-                stop_loss_pct: float = None,
-                take_profit_pct: float = None,
-                forward_candles: int = None) -> pd.Series:
-    """
-    Triple-barrier labels aligned with live SL/TP rules.
-
-    For each candle, walk forward through subsequent highs/lows:
-      BUY  (+1): take-profit reached before stop-loss
-      SELL (-1): stop-loss reached before take-profit
-      HOLD (0):  neither barrier hit within the forward window
-    If both barriers could trigger on the same candle, SL wins (conservative).
-    """
-    sl_pct = stop_loss_pct if stop_loss_pct is not None else settings.STOP_LOSS_PCT
-    tp_pct = take_profit_pct if take_profit_pct is not None else settings.TAKE_PROFIT_PCT
-    horizon = forward_candles if forward_candles is not None else FORWARD_CANDLES
-
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
-    labels = []
-
-    for i in range(len(df)):
-        entry = close.iloc[i]
-        sl_price = entry * (1 - sl_pct / 100)
-        tp_price = entry * (1 + tp_pct / 100)
-        label = 0
-
-        for j in range(1, horizon + 1):
-            if i + j >= len(df):
-                label = np.nan
-                break
-
-            bar_low  = low.iloc[i + j]
-            bar_high = high.iloc[i + j]
-            sl_hit = bar_low <= sl_price
-            tp_hit = bar_high >= tp_price
-
-            if sl_hit and tp_hit:
-                label = -1
-                break
-            if sl_hit:
-                label = -1
-                break
-            if tp_hit:
-                label = 1
-                break
-
-        labels.append(label)
-
-    return pd.Series(labels, index=df.index)
+MODEL_PATH  = "models/lgbm_model.pkl"
+SCALER_PATH = "models/scaler.pkl"
+META_PATH   = "models/training_meta.json"
 
 
 def _load_meta() -> dict:
@@ -104,22 +42,28 @@ class MLStrategy:
         self.model  = None
         self.scaler = StandardScaler()
         self._candles_since_train = 0
-        self._last_val_f1 = _load_meta().get("last_val_f1", 0.0)
+        meta = _load_meta()
+        self._last_val_f1    = meta.get("last_val_f1", 0.0)
+        self._last_val_score = meta.get("last_val_score", 0.0)
         self._load_if_exists()
 
-    # Persistence
     def _save(self):
         os.makedirs("models", exist_ok=True)
         with open(MODEL_PATH, "wb")  as f: pickle.dump(self.model,  f)
         with open(SCALER_PATH, "wb") as f: pickle.dump(self.scaler, f)
-        _save_meta({"last_val_f1": self._last_val_f1})
+        _save_meta({
+            "last_val_f1":    self._last_val_f1,
+            "last_val_score": self._last_val_score,
+        })
         log.info("Model + scaler saved.")
 
     def _load_if_exists(self):
         if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
             with open(MODEL_PATH, "rb")  as f: self.model  = pickle.load(f)
             with open(SCALER_PATH, "rb") as f: self.scaler = pickle.load(f)
-            self._last_val_f1 = _load_meta().get("last_val_f1", self._last_val_f1)
+            meta = _load_meta()
+            self._last_val_f1    = meta.get("last_val_f1", self._last_val_f1)
+            self._last_val_score = meta.get("last_val_score", self._last_val_score)
             log.info("Loaded existing model from disk.")
 
     def _build_classifier(self) -> lgb.LGBMClassifier:
@@ -138,11 +82,35 @@ class MLStrategy:
             verbose=-1,
         )
 
-    def _cross_val_f1(self, X: np.ndarray, y_mapped: np.ndarray) -> tuple[float, int, int]:
-        """Walk-forward CV: train on past folds only, score on validation fold."""
+    def _predict_with_model(self, model, scaler, df_raw: pd.DataFrame) -> tuple[str, float]:
+        df = compute_features(df_raw)
+        if df.empty:
+            return "HOLD", 0.0
+        last = df[FEATURE_COLS].iloc[[-1]].values
+        proba = model.predict_proba(scaler.transform(last))[0]
+        if len(proba) == 3:
+            p_sell, p_hold, p_buy = proba
+        elif len(proba) == 2:
+            p_sell, p_hold, p_buy = proba[0], proba[1], 0.0
+        else:
+            return "HOLD", 0.0
+        probs = [p_sell, p_hold, p_buy]
+        cls_id = int(np.argmax(probs))
+        return {0: "SELL", 1: "HOLD", 2: "BUY"}[cls_id], float(max(probs))
+
+    def _cross_validate(self, X, y_mapped, df_raw, df_index) -> tuple[dict, np.ndarray]:
+        """
+        Walk-forward CV: classification F1 + trading simulation on each val fold.
+        Returns aggregate metrics and the last validation row indices.
+        """
         tscv = TimeSeriesSplit(n_splits=3)
-        val_scores = []
+        f1_scores = []
+        trade_scores = []
+        trade_returns = []
+        trade_sharpes = []
         last_val_idx = None
+
+        raw_indices = df_raw.index.get_indexer(df_index)
 
         for train_idx, val_idx in tscv.split(X):
             scaler = StandardScaler()
@@ -152,22 +120,47 @@ class MLStrategy:
             model = self._build_classifier()
             model.fit(X_train, y_mapped[train_idx])
             val_pred = model.predict(X_val)
-
-            val_scores.append(f1_score(
+            f1_scores.append(f1_score(
                 y_mapped[val_idx], val_pred, average="macro", zero_division=0,
             ))
+
+            val_raw_idx = raw_indices[val_idx]
+            val_raw_idx = val_raw_idx[val_raw_idx >= 0]
+
+            def predict_fn(window, _m=model, _s=scaler):
+                return self._predict_with_model(_m, _s, window)
+
+            metrics = run_trading_simulation(
+                df_raw, val_raw_idx, predict_fn,
+                regime_check_fn=lambda feat: is_trending(feat, settings.ADX_THRESHOLD),
+            )
+            trade_scores.append(metrics["score"])
+            trade_returns.append(metrics["return_pct"])
+            trade_sharpes.append(metrics["sharpe"])
             last_val_idx = val_idx
 
-        return float(np.mean(val_scores)), last_val_idx, len(val_scores)
+        return {
+            "f1":        float(np.mean(f1_scores)),
+            "score":     float(np.mean(trade_scores)),
+            "return_pct": float(np.mean(trade_returns)),
+            "sharpe":    float(np.mean(trade_sharpes)),
+        }, last_val_idx
 
-    # Training
+    def _passes_deploy_gate(self, metrics: dict, force: bool) -> bool:
+        if force or self.model is None:
+            return True
+
+        f1_ok = metrics["f1"] >= settings.RETRAIN_MIN_F1
+        return_ok = metrics["return_pct"] >= settings.RETRAIN_MIN_VAL_RETURN_PCT
+        sharpe_ok = metrics["sharpe"] >= settings.RETRAIN_MIN_VAL_SHARPE
+        score_ok = metrics["score"] >= self._last_val_score * 0.95
+
+        return f1_ok and return_ok and sharpe_ok and score_ok
+
     def train(self, df_raw: pd.DataFrame, force: bool = False) -> bool:
         """
-        Train with walk-forward validation. Fits on all data only when:
-          - no model exists yet, or force=True, or
-          - validation macro-F1 meets RETRAIN_MIN_F1 and does not regress >5%
-            vs the currently deployed model.
-        Returns True if a new model was deployed.
+        Train with walk-forward validation. Deploy only when validation trading
+        metrics (return, Sharpe, composite score) and macro-F1 all pass gates.
         """
         log.info(f"Training on {len(df_raw)} candles ...")
         df = compute_features(df_raw)
@@ -176,7 +169,7 @@ class MLStrategy:
 
         X = df[FEATURE_COLS].values
         y = df["label"].values.astype(int)
-        y_mapped = y + 1   # SELL/HOLD/BUY: -1/0/1 -> LightGBM classes 0/1/2
+        y_mapped = y + 1
 
         log.info(
             f"Label distribution: SELL={int(np.sum(y==-1))} "
@@ -187,28 +180,28 @@ class MLStrategy:
             log.warning("Not enough label diversity to train — skipping.")
             return False
 
-        avg_f1, last_val_idx, n_folds = self._cross_val_f1(X, y_mapped)
-        log.info(f"Walk-forward validation macro-F1: {avg_f1:.3f} ({n_folds} folds)")
-
-        should_deploy = (
-            force
-            or self.model is None
-            or (
-                avg_f1 >= settings.RETRAIN_MIN_F1
-                and avg_f1 >= self._last_val_f1 * 0.95
-            )
+        metrics, last_val_idx = self._cross_validate(X, y_mapped, df_raw, df.index)
+        log.info(
+            f"Validation — F1={metrics['f1']:.3f} | "
+            f"return={metrics['return_pct']:+.2f}% | "
+            f"Sharpe={metrics['sharpe']:.2f} | "
+            f"score={metrics['score']:.2f}"
         )
 
-        if not should_deploy:
+        if not self._passes_deploy_gate(metrics, force):
             log.warning(
-                f"Retrain skipped — val F1 {avg_f1:.3f} "
-                f"(min={settings.RETRAIN_MIN_F1:.3f}, "
-                f"prev={self._last_val_f1:.3f})"
+                f"Retrain skipped — val score {metrics['score']:.2f} "
+                f"(prev={self._last_val_score:.2f}), "
+                f"return={metrics['return_pct']:+.2f}% "
+                f"(min={settings.RETRAIN_MIN_VAL_RETURN_PCT:.2f}%), "
+                f"Sharpe={metrics['sharpe']:.2f} "
+                f"(min={settings.RETRAIN_MIN_VAL_SHARPE:.2f}), "
+                f"F1={metrics['f1']:.3f} (min={settings.RETRAIN_MIN_F1:.3f})"
             )
             self._candles_since_train = 0
             return False
 
-        # Report on the last validation fold (no leakage into training set)
+        # Classification report on last fold (train past, validate future)
         scaler = StandardScaler()
         train_idx = np.arange(0, last_val_idx[0])
         val_idx   = last_val_idx
@@ -227,17 +220,19 @@ class MLStrategy:
             zero_division=0,
         ))
 
-        # Deploy: fit final model on all data
         X_scaled = self.scaler.fit_transform(X)
         self.model = self._build_classifier()
         self.model.fit(X_scaled, y_mapped)
-        self._last_val_f1 = avg_f1
+        self._last_val_f1    = metrics["f1"]
+        self._last_val_score = metrics["score"]
         self._save()
         self._candles_since_train = 0
-        log.info(f"Model deployed (val macro-F1={avg_f1:.3f})")
+        log.info(
+            f"Model deployed — val return={metrics['return_pct']:+.2f}%, "
+            f"Sharpe={metrics['sharpe']:.2f}, F1={metrics['f1']:.3f}"
+        )
         return True
 
-    # Inference
     def predict(self, df_raw: pd.DataFrame) -> tuple[str, float]:
         if self.model is None:
             log.warning("Model not trained yet — returning HOLD")
@@ -248,35 +243,15 @@ class MLStrategy:
             log.debug(f"predict(): empty features after dropna (window={len(df_raw)} rows)")
             return "HOLD", 0.0
 
-        last = df[FEATURE_COLS].iloc[[-1]].values
-        X_sc = self.scaler.transform(last)
-
-        proba     = self.model.predict_proba(X_sc)[0]
-        n_classes = len(proba)
-
-        if n_classes == 3:
-            p_sell, p_hold, p_buy = proba
-        elif n_classes == 2:
-            p_sell, p_hold, p_buy = proba[0], proba[1], 0.0
-        else:
-            p_sell, p_hold, p_buy = 0.0, 1.0, 0.0
-
-        cls_id     = int(np.argmax([p_sell, p_hold, p_buy]))
-        conf       = float(max(p_sell, p_hold, p_buy))
-        signal_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
-        signal     = signal_map[cls_id]
-
-        log.info(f"Signal: {signal} | Confidence: {conf:.2%} "
-                 f"[sell={p_sell:.2f} hold={p_hold:.2f} buy={p_buy:.2f}]")
+        signal, conf = self._predict_with_model(self.model, self.scaler, df_raw)
+        log.info(f"Signal: {signal} | Confidence: {conf:.2%}")
         return signal, conf
 
     def on_new_candle(self, df_raw: pd.DataFrame) -> bool:
-        """Increment candle counter; retrain with validation when due."""
         self._candles_since_train += 1
         if self._candles_since_train >= settings.RETRAIN_EVERY_N:
             return self.train(df_raw)
         return False
 
 
-# Backward-compatible alias used by backtest.py and diagnose.py
 _label = make_labels
