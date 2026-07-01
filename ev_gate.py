@@ -31,14 +31,14 @@ def round_trip_cost_pct() -> float:
     return 2.0 * per_side
 
 
-def compute_ev(p_win: float) -> float:
+def compute_ev(p_win: float, sl_pct: float = None, tp_pct: float = None) -> float:
     """
     Expected value of a long trade as a fraction (e.g. 0.01 = 1%).
 
     EV = P(win)*TP - P(loss)*SL - round_trip_costs
     """
-    tp = settings.TAKE_PROFIT_PCT / 100
-    sl = settings.STOP_LOSS_PCT / 100
+    tp = (tp_pct if tp_pct is not None else settings.TAKE_PROFIT_PCT) / 100
+    sl = (sl_pct if sl_pct is not None else settings.STOP_LOSS_PCT) / 100
     cost = round_trip_cost_pct() / 100
     return p_win * tp - (1.0 - p_win) * sl - cost
 
@@ -66,6 +66,8 @@ def evaluate_signal(
     p_buy: float,
     regime_ok: bool,
     mtf_ok: bool,
+    sl_pct: float = None,
+    tp_pct: float = None,
 ) -> SignalEvaluation:
     """Evaluate a long entry from calibrated class probabilities."""
     probs = [p_sell, p_hold, p_buy]
@@ -74,7 +76,7 @@ def evaluate_signal(
     confidence = probs[cls_id]
 
     p_win = float(p_buy)
-    ev = compute_ev(p_win)
+    ev = compute_ev(p_win, sl_pct=sl_pct, tp_pct=tp_pct)
     conviction = compute_conviction(p_win, ev, regime_ok, mtf_ok)
 
     should_exit = (

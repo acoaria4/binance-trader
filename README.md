@@ -15,6 +15,8 @@ kew_trading_bot/
 ├── features.py         ← Technical indicator feature engineering
 ├── strategy.py         ← LightGBM ML strategy engine
 ├── ev_gate.py          ← EV + conviction scoring
+├── risk_sizing.py      ← Volatility sizing + ATR barriers
+├── portfolio_state.py  ← Daily loss limits + consecutive-loss tracking
 ├── simulation.py       ← Shared trailing-stop + label simulation
 ├── backtest/
 │   └── engine.py       ← Unified backtest engine
@@ -102,11 +104,16 @@ Regime Filter (optional, REQUIRE_TREND=true)
   BUY only when ADX strong AND ATR healthy AND structure trending
         │
         ▼
-Risk Manager
-  - Checks MAX_OPEN_TRADES
-  - Sizes position from TRADE_AMOUNT_USDT
-  - Sets stop-loss, take-profit, and trailing stop
-  - Persists open positions to logs/positions.json
+EV + Conviction Gate (ev_gate.py)
+  - Dynamic EV from ATR-derived SL/TP when USE_ATR_STOPS=true
+  - P(win), EV, and conviction thresholds must all pass
+        │
+        ▼
+Risk Manager (risk.py + risk_sizing.py + portfolio_state.py)
+  - Volatility-based sizing: risk RISK_PCT_PER_TRADE of equity per trade
+  - ATR multiples for SL/TP/trail (clamped to min/max %)
+  - Portfolio heat cap, daily loss halt, consecutive-loss size reduction
+  - Persists open positions + portfolio state to logs/
         │
         ▼
 Order Executor
@@ -147,6 +154,13 @@ Binance API (full depth). Orders are placed on Binance Testnet only.
 | `ADX_THRESHOLD`         | 20.0      | Min ADX for regime filter                    |
 | `MIN_ATR_RATIO`         | 0.8       | Min ATR ratio for regime filter              |
 | `POSITIONS_FILE`        | logs/positions.json | Persisted open positions path        |
+| `USE_RISK_SIZING`       | true      | Size from risk % instead of fixed USDT       |
+| `RISK_PCT_PER_TRADE`    | 0.5       | % of equity risked per trade                 |
+| `MAX_POSITION_USDT`     | 200       | Hard cap on position notional                  |
+| `MAX_PORTFOLIO_HEAT_PCT`| 2.0     | Max aggregate open risk as % of equity         |
+| `DAILY_LOSS_LIMIT_PCT`  | 3.0       | Halt new entries after this daily drawdown     |
+| `USE_ATR_STOPS`         | true      | Derive SL/TP/trail from ATR multiples          |
+| `ATR_SL_MULT` / `ATR_TP_MULT` | 1.5 / 3.0 | ATR multipliers for barriers           |
 
 ---
 

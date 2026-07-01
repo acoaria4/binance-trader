@@ -11,7 +11,9 @@ import pandas as pd
 
 from config import settings
 from features import compute_features, is_trending, is_mtf_aligned
+from risk_sizing import barriers_for_entry, calculate_position_size, portfolio_heat_pct
 from simulation import LongTradeState, check_bar_exit, net_pnl_fraction, apply_entry_costs, apply_exit_costs
+from portfolio_state import PortfolioState
 
 
 class StrategyProtocol(Protocol):
@@ -85,14 +87,17 @@ class BacktestEngine:
         trades        = []
         in_trade      = False
         trade_state: Optional[LongTradeState] = None
+        position_qty  = 0.0
         skipped = {
             "regime": 0, "ev_gate": 0, "confidence": 0,
-            "sell_flat": 0, "mtf": 0,
+            "sell_flat": 0, "mtf": 0, "portfolio": 0,
         }
         signal_counts = {}
         retrain_count = 0
+        portfolio = PortfolioState()
 
         test_slice = df_raw.iloc[start:end]
+        df_feat_full = compute_features(df_raw)
 
         for i, (ts, row) in enumerate(test_slice.iterrows()):
             abs_i = start + i
@@ -111,7 +116,11 @@ class BacktestEngine:
                 if strategy.on_new_candle(train_window):
                     retrain_count += 1
 
-            evaluation = strategy.evaluate(window)
+            atr = None
+            if ts in df_feat_full.index and "atr_14" in df_feat_full.columns:
+                atr = float(df_feat_full.loc[ts, "atr_14"])
+
+            evaluation = strategy.evaluate(window, atr=atr)
             signal_counts[evaluation.signal] = signal_counts.get(evaluation.signal, 0) + 1
 
             if in_trade and trade_state is not None:
@@ -126,6 +135,7 @@ class BacktestEngine:
                     gross_capital *= (1 + gross_pnl)
                     equity.append(capital)
                     gross_equity.append(gross_capital)
+                    portfolio.record_closed_trade(net_pnl * 100, capital)
                     trades.append({
                         "ts": ts, "action": f"SELL_{reason.upper()}",
                         "price": exit_px, "pnl_pct": net_pnl * 100,
@@ -133,6 +143,7 @@ class BacktestEngine:
                     })
                     in_trade = False
                     trade_state = None
+                    position_qty = 0.0
                 continue
 
             if not evaluation.regime_ok:
@@ -143,18 +154,38 @@ class BacktestEngine:
                 skipped["mtf"] += 1
                 continue
 
+            ok, block = portfolio.can_enter_new()
+            if not ok:
+                skipped["portfolio"] += 1
+                continue
+
             if evaluation.should_enter:
+                barriers = barriers_for_entry(bar_close, atr)
+                sizing = calculate_position_size(
+                    capital, bar_close, barriers.stop_loss,
+                    size_multiplier=portfolio.size_multiplier(),
+                )
+                heat = portfolio_heat_pct([], capital)
+                new_heat = heat + (sizing["risk_usdt"] / capital * 100 if capital > 0 else 0)
+                if new_heat > settings.MAX_PORTFOLIO_HEAT_PCT:
+                    skipped["portfolio"] += 1
+                    continue
+
                 entry_eff = apply_entry_costs(bar_close) if cfg.apply_costs else bar_close
                 in_trade = True
-                trade_state = LongTradeState.from_entry(entry_eff)
+                position_qty = sizing["qty"]
+                trade_state = LongTradeState.from_entry(entry_eff, barriers=barriers)
                 trades.append({
                     "ts": ts, "action": "BUY", "price": bar_close,
+                    "qty": position_qty, "trade_usdt": sizing["trade_usdt"],
                     "p_win": evaluation.p_win, "ev": evaluation.ev,
                     "conviction": evaluation.conviction,
+                    "sl_pct": barriers.stop_loss_pct,
+                    "tp_pct": barriers.take_profit_pct,
                 })
             else:
                 if evaluation.signal == "BUY":
-                    if evaluation.block_reason.startswith("ev_") or evaluation.block_reason.startswith("conviction") or evaluation.block_reason.startswith("p_win"):
+                    if evaluation.block_reason.startswith(("ev_", "conviction", "p_win")):
                         skipped["ev_gate"] += 1
                     else:
                         skipped["confidence"] += 1

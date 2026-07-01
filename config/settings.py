@@ -54,6 +54,28 @@ MTF_MIN_EMA_ALIGN        = int(os.getenv("MTF_MIN_EMA_ALIGN", 1))
 MTF_MIN_PRICE_VS_EMA200  = float(os.getenv("MTF_MIN_PRICE_VS_EMA200", -0.02))
 MTF_MIN_ADX              = float(os.getenv("MTF_MIN_ADX", 15.0))
 
+# Phase 2 — risk-based sizing & portfolio controls
+USE_RISK_SIZING           = os.getenv("USE_RISK_SIZING", "true").lower() == "true"
+RISK_PCT_PER_TRADE        = float(os.getenv("RISK_PCT_PER_TRADE", 0.5))
+MAX_POSITION_USDT         = float(os.getenv("MAX_POSITION_USDT", 200))
+MAX_PORTFOLIO_HEAT_PCT    = float(os.getenv("MAX_PORTFOLIO_HEAT_PCT", 2.0))
+DAILY_LOSS_LIMIT_PCT      = float(os.getenv("DAILY_LOSS_LIMIT_PCT", 3.0))
+ENTRY_HALT_HOURS          = int(os.getenv("ENTRY_HALT_HOURS", 24))
+CONSECUTIVE_LOSS_LIMIT    = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", 3))
+CONSECUTIVE_LOSS_SIZE_FACTOR = float(os.getenv("CONSECUTIVE_LOSS_SIZE_FACTOR", 0.5))
+PORTFOLIO_STATE_FILE      = os.getenv("PORTFOLIO_STATE_FILE", "logs/portfolio_state.json")
+
+# ATR-based dynamic barriers
+USE_ATR_STOPS             = os.getenv("USE_ATR_STOPS", "true").lower() == "true"
+ATR_SL_MULT               = float(os.getenv("ATR_SL_MULT", 1.5))
+ATR_TP_MULT               = float(os.getenv("ATR_TP_MULT", 3.0))
+ATR_TRAIL_MULT            = float(os.getenv("ATR_TRAIL_MULT", 1.5))
+MIN_STOP_LOSS_PCT         = float(os.getenv("MIN_STOP_LOSS_PCT", 0.8))
+MAX_STOP_LOSS_PCT         = float(os.getenv("MAX_STOP_LOSS_PCT", 4.0))
+MIN_TAKE_PROFIT_PCT       = float(os.getenv("MIN_TAKE_PROFIT_PCT", 2.0))
+MAX_TAKE_PROFIT_PCT       = float(os.getenv("MAX_TAKE_PROFIT_PCT", 12.0))
+MIN_TRAIL_DISTANCE_PCT    = float(os.getenv("MIN_TRAIL_DISTANCE_PCT", 0.5))
+
 # Position persistence
 POSITIONS_FILE           = os.getenv("POSITIONS_FILE", "logs/positions.json")
 SIGNAL_LOG_FILE          = os.getenv("SIGNAL_LOG_FILE", "logs/signals.csv")

@@ -14,7 +14,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, f1_score
 
-from features import FEATURE_COLS, compute_features, is_trending, is_mtf_aligned
+from features import compute_features, FEATURE_COLS, is_trending, is_mtf_aligned
+from risk_sizing import barriers_for_entry
 from simulation import make_labels, run_trading_simulation
 from ev_gate import evaluate_signal, SignalEvaluation
 from evaluation.purged_cv import purged_time_series_split
@@ -106,12 +107,24 @@ class MLStrategy:
             return float(proba[0]), float(proba[1]), 0.0
         return 0.0, 1.0, 0.0
 
-    def evaluate(self, df_raw: pd.DataFrame) -> SignalEvaluation:
+    def evaluate(self, df_raw: pd.DataFrame, atr: float = None) -> SignalEvaluation:
         p_sell, p_hold, p_buy = self._get_probs(df_raw)
         df_feat = compute_features(df_raw)
         regime_ok = not settings.REQUIRE_TREND or is_trending(df_feat, settings.ADX_THRESHOLD)
         mtf_ok = is_mtf_aligned(df_feat)
-        return evaluate_signal(p_sell, p_hold, p_buy, regime_ok, mtf_ok)
+
+        if atr is None and not df_feat.empty and "atr_14" in df_feat.columns:
+            atr = float(df_feat["atr_14"].iloc[-1])
+
+        entry = float(df_raw["close"].iloc[-1]) if len(df_raw) else 0.0
+        barriers = barriers_for_entry(entry, atr) if entry > 0 else None
+        sl_pct = barriers.stop_loss_pct if barriers else None
+        tp_pct = barriers.take_profit_pct if barriers else None
+
+        return evaluate_signal(
+            p_sell, p_hold, p_buy, regime_ok, mtf_ok,
+            sl_pct=sl_pct, tp_pct=tp_pct,
+        )
 
     def _predict_with_model(self, model, scaler, df_raw: pd.DataFrame) -> tuple[str, float]:
         df = compute_features(df_raw)
@@ -141,7 +154,13 @@ class MLStrategy:
             p_sell, p_hold, p_buy = 0.0, 1.0, 0.0
         regime_ok = not settings.REQUIRE_TREND or is_trending(df, settings.ADX_THRESHOLD)
         mtf_ok = is_mtf_aligned(df)
-        return evaluate_signal(p_sell, p_hold, p_buy, regime_ok, mtf_ok)
+        atr = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else None
+        entry = float(df_raw["close"].iloc[-1])
+        barriers = barriers_for_entry(entry, atr)
+        return evaluate_signal(
+            p_sell, p_hold, p_buy, regime_ok, mtf_ok,
+            sl_pct=barriers.stop_loss_pct, tp_pct=barriers.take_profit_pct,
+        )
 
     def _cross_validate(self, X, y_mapped, df_raw, df_index) -> tuple[dict, np.ndarray]:
         f1_scores, trade_scores, trade_returns, trade_sharpes = [], [], [], []
