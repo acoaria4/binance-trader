@@ -76,6 +76,18 @@ MIN_TAKE_PROFIT_PCT       = float(os.getenv("MIN_TAKE_PROFIT_PCT", 2.0))
 MAX_TAKE_PROFIT_PCT       = float(os.getenv("MAX_TAKE_PROFIT_PCT", 12.0))
 MIN_TRAIL_DISTANCE_PCT    = float(os.getenv("MIN_TRAIL_DISTANCE_PCT", 0.5))
 
+# Phase 3 — execution fidelity
+USE_LIMIT_ORDERS            = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
+MAX_SPREAD_PCT              = float(os.getenv("MAX_SPREAD_PCT", 0.15))
+LIMIT_ORDER_OFFSET_PCT      = float(os.getenv("LIMIT_ORDER_OFFSET_PCT", 0.02))
+LIMIT_ORDER_TIMEOUT_SEC     = int(os.getenv("LIMIT_ORDER_TIMEOUT_SEC", 30))
+LIMIT_FALLBACK_TO_MARKET    = os.getenv("LIMIT_FALLBACK_TO_MARKET", "true").lower() == "true"
+USE_LIMIT_EXITS             = os.getenv("USE_LIMIT_EXITS", "false").lower() == "true"
+RECONCILE_ON_START          = os.getenv("RECONCILE_ON_START", "true").lower() == "true"
+RECONCILE_EVERY_N_LOOPS     = int(os.getenv("RECONCILE_EVERY_N_LOOPS", 10))
+CANCEL_STALE_ORDERS_SEC     = int(os.getenv("CANCEL_STALE_ORDERS_SEC", 300))
+PENDING_ORDERS_FILE         = os.getenv("PENDING_ORDERS_FILE", "logs/pending_orders.json")
+
 # Position persistence
 POSITIONS_FILE           = os.getenv("POSITIONS_FILE", "logs/positions.json")
 SIGNAL_LOG_FILE          = os.getenv("SIGNAL_LOG_FILE", "logs/signals.csv")

@@ -17,6 +17,8 @@ kew_trading_bot/
 ├── ev_gate.py          ← EV + conviction scoring
 ├── risk_sizing.py      ← Volatility sizing + ATR barriers
 ├── portfolio_state.py  ← Daily loss limits + consecutive-loss tracking
+├── execution.py        ← Limit orders, spread checks, fill handling
+├── reconciliation.py   ← Exchange ↔ local position reconciliation loop
 ├── simulation.py       ← Shared trailing-stop + label simulation
 ├── backtest/
 │   └── engine.py       ← Unified backtest engine
@@ -116,8 +118,11 @@ Risk Manager (risk.py + risk_sizing.py + portfolio_state.py)
   - Persists open positions + portfolio state to logs/
         │
         ▼
-Order Executor
-  Market orders via ccxt → Binance Testnet
+Order Executor (execution.py + exchange.py)
+  - Spread gate: skip entries when bid-ask spread exceeds MAX_SPREAD_PCT
+  - Limit orders inside the spread with timeout + optional market fallback
+  - Urgent exits (SL/TP) use market; signal exits can use limit (USE_LIMIT_EXITS)
+  - Periodic reconciliation loop syncs exchange balances vs tracked positions
         │
         ▼
 Trade Logger (CSV) + console status display
@@ -161,6 +166,10 @@ Binance API (full depth). Orders are placed on Binance Testnet only.
 | `DAILY_LOSS_LIMIT_PCT`  | 3.0       | Halt new entries after this daily drawdown     |
 | `USE_ATR_STOPS`         | true      | Derive SL/TP/trail from ATR multiples          |
 | `ATR_SL_MULT` / `ATR_TP_MULT` | 1.5 / 3.0 | ATR multipliers for barriers           |
+| `USE_LIMIT_ORDERS`      | true      | Use limit orders for entries (market fallback) |
+| `MAX_SPREAD_PCT`        | 0.15      | Max bid-ask spread % to allow entry            |
+| `LIMIT_ORDER_TIMEOUT_SEC` | 30      | Seconds to wait for limit fill before fallback   |
+| `RECONCILE_EVERY_N_LOOPS` | 10      | Run reconciliation every N bot loop iterations   |
 
 ---
 
