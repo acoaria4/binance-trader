@@ -1,7 +1,7 @@
 """
 fetch_history.py
 Fetch large historical datasets from Binance public API
-and save to CSV for TFT training.
+and save to CSV for offline training.
 
 Usage:
     python fetch_history.py --symbol BTC/USDT --timeframe 4h --limit 10000
@@ -48,4 +48,4 @@ if __name__ == "__main__":
     for sym in symbols:
         fetch_and_save(sym, args.timeframe, args.limit)
 
-    log.info("All done! Run: python backtest_tft.py to train and evaluate.")
+    log.info("All done! Run: python train_lgbm.py --use-saved --timeframe <tf>")

@@ -14,7 +14,11 @@ kew_trading_bot/
 ├── exchange.py         ← Binance Testnet connector (ccxt)
 ├── features.py         ← Technical indicator feature engineering
 ├── strategy.py         ← LightGBM ML strategy engine
+├── simulation.py       ← Shared trailing-stop + label simulation
 ├── risk.py             ← Position sizing + stop-loss/take-profit
+├── train_lgbm.py       ← Offline training on large/multi-asset datasets
+├── fetch_all_history.py← Bulk historical data download
+├── diagnose.py         ← Inspect model probability distributions
 ├── config/
 │   └── settings.py     ← All settings loaded from .env
 ├── utils/
@@ -22,6 +26,7 @@ kew_trading_bot/
 │   └── trade_logger.py ← CSV trade journal
 ├── models/             ← Saved model + scaler (auto-created)
 ├── logs/               ← Log + trade CSV (auto-created)
+├── data/               ← Saved OHLCV/feature CSVs (auto-created)
 ├── .env.example        ← Copy to .env and fill in your keys
 └── requirements.txt
 ```
@@ -65,26 +70,34 @@ Press **Ctrl+C** to stop cleanly.
 ## How It Works
 
 ```
-Binance Testnet OHLCV
-        │
-        ▼
-Feature Engineering
-  RSI, MACD, Bollinger Bands, ATR, OBV, stochastics,
-  candle structure, N-period returns (19 features total)
+Public Binance OHLCV (data)          Binance Testnet (orders)
+        │                                      ▲
+        ▼                                      │
+Feature Engineering ───────────────────────────┤
+  RSI, MACD, Bollinger Bands, ATR, ADX, OBV,
+  stochastics, candle structure, returns
+  (37 features total — see features.FEATURE_COLS)
         │
         ▼
 LightGBM Classifier
   Predicts: BUY / HOLD / SELL
-  Trained on forward-looking labels:
-    BUY  = price rises > take_profit% in next 5 candles
-    SELL = price drops > stop_loss%  in next 5 candles
-    HOLD = neither
+  Labels simulate full trade path with trailing stops (intrabar high/low):
+    BUY  = profitable exit (TP or trailing lock-in)
+    SELL = stopped out at a loss
+    HOLD = no exit within forward window
+  Retrain deploys only when walk-forward validation passes:
+    macro-F1, validation return %, Sharpe, and composite score
+        │
+        ▼
+Regime Filter (optional, REQUIRE_TREND=true)
+  BUY only when ADX strong AND ATR healthy AND structure trending
         │
         ▼
 Risk Manager
   - Checks MAX_OPEN_TRADES
   - Sizes position from TRADE_AMOUNT_USDT
-  - Sets stop-loss and take-profit prices
+  - Sets stop-loss, take-profit, and trailing stop
+  - Persists open positions to logs/positions.json
         │
         ▼
 Order Executor
@@ -93,6 +106,9 @@ Order Executor
         ▼
 Trade Logger (CSV) + console status display
 ```
+
+**Data vs execution:** Historical candles are fetched from the public live
+Binance API (full depth). Orders are placed on Binance Testnet only.
 
 ---
 
@@ -104,19 +120,40 @@ Trade Logger (CSV) + console status display
 | `TIMEFRAME`             | 1h        | Candle interval                              |
 | `TRADE_AMOUNT_USDT`     | 50        | USDT per trade                               |
 | `MAX_OPEN_TRADES`       | 3         | Concurrent positions cap                     |
-| `STOP_LOSS_PCT`         | 2.0       | % below entry to cut loss                    |
-| `TAKE_PROFIT_PCT`       | 4.0       | % above entry to take profit                 |
-| `MIN_SIGNAL_CONFIDENCE` | 0.6       | Min ML probability to act (0–1)              |
+| `STOP_LOSS_PCT`         | 1.5       | % below entry to cut loss                    |
+| `TAKE_PROFIT_PCT`       | 5.0       | % above entry to take profit                 |
+| `MIN_SIGNAL_CONFIDENCE` | 0.62      | Min ML probability to act (0–1)              |
 | `RETRAIN_EVERY_N`       | 50        | Retrain model every N new candles            |
+| `RETRAIN_MIN_F1`        | 0.25      | Min macro-F1 on validation fold              |
+| `RETRAIN_MIN_VAL_RETURN_PCT` | 0.0  | Min simulated return % on validation fold    |
+| `RETRAIN_MIN_VAL_SHARPE` | 0.0      | Min Sharpe on validation fold                |
+| `TRAIL_ACTIVATE_PCT`    | 1.0       | Gain % before trailing stop activates        |
+| `TRAIL_DISTANCE_PCT`    | 1.5       | Trail distance below high (defaults to SL)   |
+| `FORWARD_CANDLES`       | 10        | Label / forward simulation horizon           |
+| `REQUIRE_TREND`         | true      | Skip BUY when regime filter says ranging     |
+| `ADX_THRESHOLD`         | 20.0      | Min ADX for regime filter                    |
+| `MIN_ATR_RATIO`         | 0.8       | Min ATR ratio for regime filter              |
+| `POSITIONS_FILE`        | logs/positions.json | Persisted open positions path        |
+
+---
+
+## Offline Training (optional)
+
+Download full history and train on multiple assets:
+
+```bash
+python fetch_all_history.py --timeframe 1h
+python train_lgbm.py --use-saved --timeframe 1h
+```
 
 ---
 
 ## Upgrading the Strategy
 
-The strategy lives entirely in `strategy.py`. To upgrade:
+The strategy lives in `strategy.py`. To upgrade:
 - **LSTM/Transformer**: Replace LightGBM with a PyTorch sequence model
 - **More features**: Add to `features.py` → `FEATURE_COLS`
-- **Regime detection**: Add a volatility-regime classifier before the signal model
+- **Regime detection**: Tune `is_trending()` in `features.py`
 - **Shorts**: Enable `side='short'` in `risk.py` and use Binance Futures testnet
 
 ---

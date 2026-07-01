@@ -11,6 +11,8 @@ import pandas as pd
 import numpy as np
 import ta
 
+from config import settings
+
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -101,22 +103,27 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def is_trending(df: pd.DataFrame, adx_threshold: float = 20.0) -> bool:
+def is_trending(df: pd.DataFrame,
+                adx_threshold: float = 20.0,
+                min_atr_ratio: float = None) -> bool:
     """
     Regime filter: returns True if the market is currently trending.
     Uses the last row of a feature-computed DataFrame.
 
-    Conditions for TRENDING (all must be true):
+    All conditions must be met:
       - ADX > adx_threshold (trend strength)
-      - ATR ratio > 0.8 (not in a volatility collapse)
+      - ATR ratio > min_atr_ratio (not in a volatility collapse)
+      - EMA alignment >= 2 OR price is >1% away from EMA200
     """
     if df.empty or "adx" not in df.columns:
         return True
+
+    atr_min = min_atr_ratio if min_atr_ratio is not None else settings.MIN_ATR_RATIO
     last = df.iloc[-1]
-    adx_ok   = last["adx"] > adx_threshold
-    ema_ok   = last["ema_align"] >= 2
-    trend_ok = abs(last["price_vs_ema200"]) > 0.01
-    return bool(adx_ok or ema_ok or trend_ok)
+    adx_ok       = last["adx"] > adx_threshold
+    atr_ok       = last["atr_ratio"] > atr_min
+    structure_ok = last["ema_align"] >= 2 or abs(last["price_vs_ema200"]) > 0.01
+    return bool(adx_ok and atr_ok and structure_ok)
 
 
 FEATURE_COLS = [
