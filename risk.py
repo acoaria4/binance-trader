@@ -18,6 +18,7 @@ from risk_sizing import (
     calculate_position_size, portfolio_heat_pct,
 )
 from portfolio_state import PortfolioState
+from reconciliation import reconcile_positions
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -121,36 +122,7 @@ class RiskManager:
             log.warning(f"Could not load positions file: {e}")
 
     def reconcile(self, exchange: ccxt.binance, symbol: str = None) -> None:
-        symbol = symbol or settings.SYMBOL
-        base_asset = symbol.split("/")[0]
-        try:
-            balance = exchange.fetch_balance()
-            free_base = float(balance["free"].get(base_asset, 0.0))
-        except Exception as e:
-            log.warning(f"Balance reconcile skipped: {e}")
-            return
-
-        kept = []
-        for pos in self.open_positions:
-            if pos.symbol != symbol:
-                kept.append(pos)
-                continue
-            if free_base >= pos.quantity * BALANCE_TOLERANCE:
-                kept.append(pos)
-            else:
-                log.warning(
-                    f"Dropping stale position {pos.symbol}: "
-                    f"tracked qty={pos.quantity:.6f}, exchange free={free_base:.6f}"
-                )
-        self.open_positions = kept
-
-        tracked_qty = sum(p.quantity for p in self.open_positions if p.symbol == symbol)
-        if free_base > 0 and tracked_qty < free_base * BALANCE_TOLERANCE:
-            log.warning(
-                f"Untracked {base_asset} balance: {free_base:.6f} "
-                f"(tracked={tracked_qty:.6f})"
-            )
-        self._persist()
+        reconcile_positions(exchange, self, symbol=symbol, adopt_untracked=False)
 
     def record_closed_trade(self, pnl_pct: float, equity: float) -> None:
         self.portfolio.record_closed_trade(pnl_pct, equity)

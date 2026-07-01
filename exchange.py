@@ -126,6 +126,89 @@ def get_balance(exchange: ccxt.binance, currency: str = "USDT") -> float:
     return free
 
 
+def get_spread_pct(exchange: ccxt.binance, symbol: str) -> tuple[float, float, float]:
+    """
+    Returns (spread_pct, bid, ask).
+    spread_pct = (ask - bid) / mid * 100
+    """
+    try:
+        book = exchange.fetch_order_book(symbol, limit=5)
+        bid = float(book["bids"][0][0]) if book.get("bids") else 0.0
+        ask = float(book["asks"][0][0]) if book.get("asks") else 0.0
+    except Exception as e:
+        log.warning(f"Order book fetch failed for {symbol}: {e}")
+        ticker = exchange.fetch_ticker(symbol)
+        last = float(ticker.get("last") or ticker.get("close") or 0.0)
+        return 0.0, last, last
+
+    mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+    if mid <= 0:
+        return 0.0, bid, ask
+    spread_pct = (ask - bid) / mid * 100
+    return spread_pct, bid, ask
+
+
+def normalize_fill(order: dict, fallback_price: float = 0.0) -> dict:
+    """Extract fill details from a ccxt order response."""
+    filled_qty = float(order.get("filled") or order.get("amount") or 0.0)
+    avg_price = float(order.get("average") or order.get("price") or fallback_price)
+    if filled_qty <= 0 and order.get("cost") and avg_price > 0:
+        filled_qty = float(order["cost"]) / avg_price
+    return {
+        "order_id": str(order.get("id", "")),
+        "filled_qty": filled_qty,
+        "avg_price": avg_price,
+        "status": order.get("status", "unknown"),
+        "cost": float(order.get("cost") or filled_qty * avg_price),
+    }
+
+
+def wait_for_order_fill(
+    exchange: ccxt.binance,
+    symbol: str,
+    order_id: str,
+    timeout_sec: int = 30,
+    poll_interval_sec: float = 1.0,
+) -> dict:
+    """Poll order until closed/canceled or timeout. Returns normalize_fill-compatible dict."""
+    deadline = time.time() + timeout_sec
+    last = {"order_id": order_id, "filled_qty": 0.0, "avg_price": 0.0, "status": "open"}
+
+    while time.time() < deadline:
+        try:
+            order = exchange.fetch_order(order_id, symbol)
+            last = normalize_fill(order)
+            last["status"] = order.get("status", "unknown")
+            if last["status"] in ("closed", "canceled", "expired"):
+                return last
+            if last["filled_qty"] > 0 and last["status"] == "open":
+                time.sleep(poll_interval_sec)
+                continue
+        except Exception as e:
+            log.warning(f"fetch_order {order_id} failed: {e}")
+        time.sleep(poll_interval_sec)
+
+    try:
+        order = exchange.fetch_order(order_id, symbol)
+        last = normalize_fill(order)
+        last["status"] = order.get("status", "timeout")
+    except Exception:
+        last["status"] = "timeout"
+    return last
+
+
+def cancel_order_safe(exchange: ccxt.binance, order_id: str, symbol: str) -> bool:
+    if not order_id:
+        return False
+    try:
+        exchange.cancel_order(order_id, symbol)
+        log.info(f"Cancelled order {order_id}")
+        return True
+    except Exception as e:
+        log.warning(f"Cancel order {order_id} failed: {e}")
+        return False
+
+
 def place_market_buy(exchange: ccxt.binance,
                      symbol: str,
                      amount_usdt: float) -> dict:
@@ -166,21 +249,48 @@ def place_market_order(exchange: ccxt.binance,
     )
 
 
+def place_limit_buy(exchange: ccxt.binance,
+                    symbol: str,
+                    amount_usdt: float,
+                    price: float) -> dict:
+    """Limit buy at a specific price using USDT notional."""
+    price = float(exchange.price_to_precision(symbol, price))
+    qty   = float(exchange.amount_to_precision(symbol, amount_usdt / price))
+    order = exchange.create_order(
+        symbol=symbol, type="limit", side="buy",
+        amount=qty, price=price,
+    )
+    log.info(f"Limit BUY {qty} {symbol} @ {price:.2f} (~{amount_usdt:.2f} USDT)")
+    return order
+
+
+def place_limit_sell(exchange: ccxt.binance,
+                     symbol: str,
+                     quantity: float,
+                     price: float) -> dict:
+    """Limit sell at a specific price using base-asset quantity."""
+    price = float(exchange.price_to_precision(symbol, price))
+    qty   = float(exchange.amount_to_precision(symbol, quantity))
+    order = exchange.create_order(
+        symbol=symbol, type="limit", side="sell",
+        amount=qty, price=price,
+    )
+    log.info(f"Limit SELL {qty} {symbol} @ {price:.2f}")
+    return order
+
+
 def place_limit_order(exchange: ccxt.binance,
                       symbol: str,
                       side: str,
                       amount_usdt: float,
                       price: float) -> dict:
-    qty   = amount_usdt / price
-    qty   = exchange.amount_to_precision(symbol, qty)
-    order = exchange.create_order(
-        symbol=symbol, type="limit", side=side,
-        amount=float(qty), price=price,
-    )
-    log.info(f"Limit order -> {side.upper()} {qty} {symbol} @ {price:.2f} USDT")
-    return order
+    """Backward-compatible limit order wrapper."""
+    if side.lower() == "buy":
+        return place_limit_buy(exchange, symbol, amount_usdt, price)
+    ticker = exchange.fetch_ticker(symbol)
+    qty = amount_usdt / float(ticker["last"])
+    return place_limit_sell(exchange, symbol, qty, price)
 
 
 def cancel_order(exchange: ccxt.binance, order_id: str, symbol: str) -> None:
-    exchange.cancel_order(order_id, symbol)
-    log.info(f"Cancelled order {order_id}")
+    cancel_order_safe(exchange, order_id, symbol)
