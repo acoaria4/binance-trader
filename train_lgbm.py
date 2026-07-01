@@ -15,45 +15,14 @@ import argparse
 import os
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-import pickle
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
 
 from exchange  import get_data_exchange, fetch_ohlcv
 from features  import compute_features, FEATURE_COLS, is_trending
+from strategy  import MLStrategy
 from config    import settings
 from utils.logger import get_logger
 
 log = get_logger("train_lgbm")
-
-MODEL_PATH  = "models/lgbm_model.pkl"
-SCALER_PATH = "models/scaler.pkl"
-FORWARD_CANDLES = 10
-
-
-def make_labels(df: pd.DataFrame) -> pd.Series:
-    """Percentile-based labels — same as our proven strategy."""
-    close = df["close"]
-    scores = []
-    for i in range(len(close)):
-        if i + FORWARD_CANDLES >= len(close):
-            scores.append(np.nan)
-            continue
-        fut     = close.iloc[i+1:i+1+FORWARD_CANDLES]
-        max_ret = (fut.max() - close.iloc[i]) / close.iloc[i]
-        min_ret = (fut.min() - close.iloc[i]) / close.iloc[i]
-        scores.append(max_ret + min_ret)
-    s = pd.Series(scores, index=df.index)
-    buy_t  = s.quantile(0.75)
-    sell_t = s.quantile(0.25)
-    labels = []
-    for v in scores:
-        if pd.isna(v):       labels.append(1)
-        elif v >= buy_t:     labels.append(2)   # BUY
-        elif v <= sell_t:    labels.append(0)   # SELL
-        else:                labels.append(1)   # HOLD
-    return pd.Series(labels, index=df.index)
 
 
 def load_saved_data(timeframe: str, symbols: list) -> tuple:
@@ -78,56 +47,11 @@ def load_saved_data(timeframe: str, symbols: list) -> tuple:
 
 
 def train_lgbm(df_train: pd.DataFrame) -> tuple:
-    """Train LightGBM on the provided dataframe."""
-    log.info(f"Computing features for {len(df_train):,} candles ...")
-    df = compute_features(df_train)
-    df["label"] = make_labels(df)
-    df.dropna(inplace=True)
-
-    X = df[FEATURE_COLS].values
-    y = df["label"].values
-    y_mapped = y + 1   # -1->0, 0->1, 1->2... wait labels are already 0/1/2
-
-    log.info(f"Label distribution: SELL={int((y==0).sum())} HOLD={int((y==1).sum())} BUY={int((y==2).sum())}")
-
-    scaler = StandardScaler()
-    X_sc   = scaler.fit_transform(X)
-
-    model = lgb.LGBMClassifier(
-        n_estimators=500,        # More trees with more data
-        learning_rate=0.03,
-        num_leaves=31,
-        max_depth=6,
-        min_child_samples=50,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        class_weight="balanced",
-        random_state=42,
-        verbose=-1,
-        n_jobs=-1,               # Use all CPU cores
-    )
-
-    log.info("Training LightGBM ...")
-    model.fit(X_sc, y)
-
-    # Validation report on last 20% of training data
-    split   = int(len(X_sc) * 0.8)
-    val_pred = model.predict(X_sc[split:])
-    log.info("\n" + classification_report(
-        y[split:], val_pred,
-        target_names=["SELL", "HOLD", "BUY"],
-        zero_division=0,
-    ))
-
-    # Save model
-    os.makedirs("models", exist_ok=True)
-    with open(MODEL_PATH,  "wb") as f: pickle.dump(model,  f)
-    with open(SCALER_PATH, "wb") as f: pickle.dump(scaler, f)
-    log.info(f"Model saved to {MODEL_PATH}")
-
-    return model, scaler
+    """Train via MLStrategy (triple-barrier labels + walk-forward validation)."""
+    log.info(f"Training on {len(df_train):,} candles via MLStrategy ...")
+    strat = MLStrategy()
+    strat.train(df_train, force=True)
+    return strat.model, strat.scaler
 
 
 def run_backtest(model, scaler, df_test_raw: pd.DataFrame) -> None:

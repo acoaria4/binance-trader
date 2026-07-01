@@ -1,7 +1,7 @@
 """
 backtest.py
-Walk-forward backtester with regime filter, confidence threshold,
-and improved risk/reward ratio.
+Walk-forward backtester with periodic retraining, regime filter,
+and triple-barrier-aligned labels.
 
 Usage:
     python backtest.py --symbol BTC/USDT --timeframe 1h --limit 5000
@@ -11,12 +11,14 @@ import pandas as pd
 import numpy as np
 
 from exchange  import get_data_exchange, fetch_ohlcv
-from features  import compute_features, FEATURE_COLS, is_trending
-from strategy  import MLStrategy, _label, FORWARD_CANDLES
+from features  import compute_features, is_trending
+from strategy  import MLStrategy
 from config    import settings
 from utils.logger import get_logger
 
 log = get_logger("backtest")
+
+MIN_WINDOW = 250
 
 
 def run_backtest(symbol: str, timeframe: str, limit: int,
@@ -24,57 +26,60 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
 
     exchange = get_data_exchange()
     df_raw   = fetch_ohlcv(exchange, symbol=symbol, timeframe=timeframe, limit=limit)
-    df       = compute_features(df_raw)
-    df["label"] = _label(df)
 
-    split    = int(len(df) * train_frac)
-    df_train = df.iloc[:split]
-    df_test  = df.iloc[split:]
+    split          = int(len(df_raw) * train_frac)
+    df_train_raw   = df_raw.iloc[:split]
+    df_test_raw    = df_raw.iloc[split:]
 
-    log.info(f"Train candles: {len(df_train)} | Test candles: {len(df_test)}")
+    log.info(f"Train candles: {len(df_train_raw)} | Test candles: {len(df_test_raw)}")
 
     strat = MLStrategy()
-    strat.train(df_train.drop(columns=["label"]))
+    strat.train(df_train_raw, force=True)
 
-    # ── Walk-forward simulation ───────────────────────────────────────────────
-    capital    = 1000.0
-    equity     = [capital]
-    trades     = []
-    in_trade   = False
-    entry_p    = 0.0
+    capital          = 1000.0
+    equity           = [capital]
+    trades           = []
+    in_trade         = False
+    entry_p          = 0.0
+    current_sl       = 0.0
+    highest_price    = 0.0
     skipped_regime   = 0
     skipped_conf     = 0
+    skipped_sell_flat = 0
+    retrain_count    = 0
     signal_counts    = {}
 
-    # Use RAW ohlcv for windows so compute_features runs inside predict()
-    # Need 250+ candles so EMA200 + dropna leaves usable rows
-    MIN_WINDOW   = 250
-    test_start_raw = len(df_raw) - len(df_test)
+    test_start_raw = split
 
-    for i, (ts, row) in enumerate(df_test.iterrows()):
+    for i, (ts, row) in enumerate(df_test_raw.iterrows()):
         abs_i  = test_start_raw + i
-        window = df_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WINDOW)):abs_i]
+        window = df_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WINDOW)):abs_i + 1]
         if len(window) < MIN_WINDOW:
             continue
 
-        price = row["close"]
+        price = float(row["close"])
 
-        # ── Exit logic with trailing stop ─────────────────────────────────────
+        # Periodic retrain (mirrors live bot — rolling window)
+        train_window = df_raw.iloc[max(0, abs_i + 1 - 2000):abs_i + 1]
+        if strat.on_new_candle(train_window):
+            retrain_count += 1
+
         if in_trade:
             tp = entry_p * (1 + settings.TAKE_PROFIT_PCT / 100)
 
-            # Update trailing stop
             if price > highest_price:
                 highest_price = price
             gain_pct = (highest_price - entry_p) / entry_p * 100
-            if gain_pct >= 1.0:   # Activate trailing after 1% gain
+            if gain_pct >= 1.0:
                 trail_sl = highest_price * (1 - settings.STOP_LOSS_PCT / 100)
                 if trail_sl > current_sl:
                     current_sl = trail_sl
 
             reason = None
-            if price >= tp:          reason = "TP"
-            elif price <= current_sl: reason = "SL"
+            if price >= tp:
+                reason = "TP"
+            elif price <= current_sl:
+                reason = "SL"
 
             if reason is None:
                 signal, conf = strat.predict(window)
@@ -83,7 +88,7 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
                     reason = "SIGNAL"
 
             if reason:
-                pnl_pct  = (price - entry_p) / entry_p
+                pnl_pct = (price - entry_p) / entry_p
                 capital *= (1 + pnl_pct)
                 equity.append(capital)
                 trades.append({
@@ -93,8 +98,6 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
                 in_trade = False
             continue
 
-        # ── Entry logic ───────────────────────────────────────────────────────
-        # Fix 1: Regime filter — compute features first, then check regime
         window_feat = compute_features(window)
         if settings.REQUIRE_TREND and not is_trending(window_feat, settings.ADX_THRESHOLD):
             skipped_regime += 1
@@ -103,19 +106,20 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
         signal, conf = strat.predict(window)
         signal_counts[signal] = signal_counts.get(signal, 0) + 1
 
-        # Fix 2: Confidence threshold
+        if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+            skipped_sell_flat += 1
+
         if signal != "BUY" or conf < settings.MIN_SIGNAL_CONFIDENCE:
             if signal == "BUY":
                 skipped_conf += 1
             continue
 
-        entry_p      = price
-        current_sl   = price * (1 - settings.STOP_LOSS_PCT / 100)
+        entry_p       = price
+        current_sl    = price * (1 - settings.STOP_LOSS_PCT / 100)
         highest_price = price
-        in_trade     = True
+        in_trade      = True
         trades.append({"ts": ts, "action": "BUY", "price": price, "conf": conf})
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     closed = [t for t in trades if "pnl_pct" in t]
     wins   = [t for t in closed if t["pnl_pct"] > 0]
     total_return = (capital - 1000) / 1000 * 100
@@ -128,22 +132,23 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
     max_dd  = (max_eq - min_eq) / max_eq * 100
 
     print("\n" + "─" * 52)
-    print(f"  Backtest: {symbol} | {timeframe} | {len(df_test)} candles")
+    print(f"  Backtest: {symbol} | {timeframe} | {len(df_test_raw)} candles")
     print(f"  Settings: SL={settings.STOP_LOSS_PCT}% | TP={settings.TAKE_PROFIT_PCT}% | "
           f"MinConf={settings.MIN_SIGNAL_CONFIDENCE:.0%} | ADX>{settings.ADX_THRESHOLD}")
     print("─" * 52)
-    print(f"  Trades:          {len(closed)}")
-    print(f"  Win rate:        {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate:   N/A")
-    print(f"  Total return:    {total_return:+.2f}%")
-    print(f"  Max drawdown:    -{max_dd:.2f}%")
-    print(f"  Sharpe:          {sharpe:.2f}")
-    print(f"  Final equity:    {capital:.2f} USDT (start: 1000)")
-    print(f"  Skipped (regime):{skipped_regime}")
-    print(f"  Skipped (conf):  {skipped_conf}")
-    print(f"  Signal counts:   {signal_counts}")
+    print(f"  Trades:            {len(closed)}")
+    print(f"  Win rate:          {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate:          N/A")
+    print(f"  Total return:      {total_return:+.2f}%")
+    print(f"  Max drawdown:      -{max_dd:.2f}%")
+    print(f"  Sharpe:            {sharpe:.2f}")
+    print(f"  Final equity:      {capital:.2f} USDT (start: 1000)")
+    print(f"  Retrains:          {retrain_count}")
+    print(f"  Skipped (regime):  {skipped_regime}")
+    print(f"  Skipped (conf):    {skipped_conf}")
+    print(f"  SELL flat (long):  {skipped_sell_flat}")
+    print(f"  Signal counts:     {signal_counts}")
     print("─" * 52)
 
-    # ── ASCII equity curve ─────────────────────────────────────────────────────
     if len(equity) > 1:
         mn, mx = min(equity), max(equity)
         height = 8
