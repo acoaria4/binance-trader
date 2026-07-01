@@ -12,7 +12,7 @@ import numpy as np
 
 from exchange  import get_data_exchange, fetch_ohlcv
 from features  import compute_features, FEATURE_COLS, is_trending
-from strategy  import MLStrategy, _label, FORWARD_CANDLES
+from strategy  import MLStrategy, make_labels, FORWARD_CANDLES
 from config    import settings
 from utils.logger import get_logger
 
@@ -25,7 +25,7 @@ def run_backtest(symbol: str, timeframe: str, limit: int,
     exchange = get_data_exchange()
     df_raw   = fetch_ohlcv(exchange, symbol=symbol, timeframe=timeframe, limit=limit)
     df       = compute_features(df_raw)
-    df["label"] = _label(df)
+    df["label"] = make_labels(df)
 
     split    = int(len(df) * train_frac)
     df_train = df.iloc[:split]

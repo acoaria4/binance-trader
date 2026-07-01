@@ -164,5 +164,5 @@ if __name__ == "__main__":
     for f in saved_files:
         size = os.path.getsize(f) / 1024 / 1024
         print(f"    {f} ({size:.1f} MB)")
-    print(f"\n  Next: python train_tft.py --use-saved")
+    print(f"\n  Next: python train_lgbm.py --use-saved --timeframe {args.timeframe}")
     print(f"{'='*52}")

@@ -31,7 +31,7 @@ SCALER_PATH     = "models/scaler.pkl"
 FORWARD_CANDLES = 10   # Look ahead 10 candles
 
 
-def _label(df: pd.DataFrame) -> pd.Series:
+def make_labels(df: pd.DataFrame) -> pd.Series:
     """
     Percentile-based forward-looking labels.
 
@@ -101,11 +101,11 @@ class MLStrategy:
     def train(self, df_raw: pd.DataFrame) -> None:
         log.info(f"Training on {len(df_raw)} candles ...")
         df = compute_features(df_raw)
-        df["label"] = _label(df)
+        df["label"] = make_labels(df)
 
         X = df[FEATURE_COLS].values
         y = df["label"].values
-        y_mapped = y + 1   # -1->0, 0->1, 1->2
+        y_mapped = y + 1   # SELL/HOLD/BUY: -1/0/1 -> LightGBM classes 0/1/2
 
         unique_classes = np.unique(y_mapped)
         log.info(f"Label distribution: SELL={int(np.sum(y==-1))} HOLD={int(np.sum(y==0))} BUY={int(np.sum(y==1))}")
@@ -185,3 +185,7 @@ class MLStrategy:
         self._candles_since_train += 1
         if self._candles_since_train >= settings.RETRAIN_EVERY_N:
             self.train(df_raw)
+
+
+# Backward-compatible alias used by backtest.py and diagnose.py
+_label = make_labels

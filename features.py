@@ -106,9 +106,10 @@ def is_trending(df: pd.DataFrame, adx_threshold: float = 20.0) -> bool:
     Regime filter: returns True if the market is currently trending.
     Uses the last row of a feature-computed DataFrame.
 
-    Conditions for TRENDING (all must be true):
+    Conditions for TRENDING (any one is sufficient):
       - ADX > adx_threshold (trend strength)
-      - ATR ratio > 0.8 (not in a volatility collapse)
+      - EMA alignment score >= 2 (bullish EMA stack)
+      - Price is more than 1% away from EMA200
     """
     if df.empty or "adx" not in df.columns:
         return True

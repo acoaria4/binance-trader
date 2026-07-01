@@ -15,6 +15,9 @@ kew_trading_bot/
 ├── features.py         ← Technical indicator feature engineering
 ├── strategy.py         ← LightGBM ML strategy engine
 ├── risk.py             ← Position sizing + stop-loss/take-profit
+├── train_lgbm.py       ← Offline training on large/multi-asset datasets
+├── fetch_all_history.py← Bulk historical data download
+├── diagnose.py         ← Inspect model probability distributions
 ├── config/
 │   └── settings.py     ← All settings loaded from .env
 ├── utils/
@@ -22,6 +25,7 @@ kew_trading_bot/
 │   └── trade_logger.py ← CSV trade journal
 ├── models/             ← Saved model + scaler (auto-created)
 ├── logs/               ← Log + trade CSV (auto-created)
+├── data/               ← Saved OHLCV/feature CSVs (auto-created)
 ├── .env.example        ← Copy to .env and fill in your keys
 └── requirements.txt
 ```
@@ -65,26 +69,32 @@ Press **Ctrl+C** to stop cleanly.
 ## How It Works
 
 ```
-Binance Testnet OHLCV
-        │
-        ▼
-Feature Engineering
-  RSI, MACD, Bollinger Bands, ATR, OBV, stochastics,
-  candle structure, N-period returns (19 features total)
+Public Binance OHLCV (data)          Binance Testnet (orders)
+        │                                      ▲
+        ▼                                      │
+Feature Engineering ───────────────────────────┤
+  RSI, MACD, Bollinger Bands, ATR, ADX, OBV,
+  stochastics, candle structure, returns
+  (37 features total — see features.FEATURE_COLS)
         │
         ▼
 LightGBM Classifier
   Predicts: BUY / HOLD / SELL
-  Trained on forward-looking labels:
-    BUY  = price rises > take_profit% in next 5 candles
-    SELL = price drops > stop_loss%  in next 5 candles
-    HOLD = neither
+  Trained on percentile-based forward-looking labels:
+    score = max_return + min_return over next 10 candles
+    BUY  = top 25% scores
+    SELL = bottom 25% scores
+    HOLD = middle 50%
+        │
+        ▼
+Regime Filter (optional, REQUIRE_TREND=true)
+  BUY only when market looks trending (ADX, EMA stack, or price vs EMA200)
         │
         ▼
 Risk Manager
   - Checks MAX_OPEN_TRADES
   - Sizes position from TRADE_AMOUNT_USDT
-  - Sets stop-loss and take-profit prices
+  - Sets stop-loss, take-profit, and trailing stop
         │
         ▼
 Order Executor
@@ -93,6 +103,9 @@ Order Executor
         ▼
 Trade Logger (CSV) + console status display
 ```
+
+**Data vs execution:** Historical candles are fetched from the public live
+Binance API (full depth). Orders are placed on Binance Testnet only.
 
 ---
 
@@ -104,19 +117,32 @@ Trade Logger (CSV) + console status display
 | `TIMEFRAME`             | 1h        | Candle interval                              |
 | `TRADE_AMOUNT_USDT`     | 50        | USDT per trade                               |
 | `MAX_OPEN_TRADES`       | 3         | Concurrent positions cap                     |
-| `STOP_LOSS_PCT`         | 2.0       | % below entry to cut loss                    |
-| `TAKE_PROFIT_PCT`       | 4.0       | % above entry to take profit                 |
-| `MIN_SIGNAL_CONFIDENCE` | 0.6       | Min ML probability to act (0–1)              |
+| `STOP_LOSS_PCT`         | 1.5       | % below entry to cut loss                    |
+| `TAKE_PROFIT_PCT`       | 5.0       | % above entry to take profit                 |
+| `MIN_SIGNAL_CONFIDENCE` | 0.62      | Min ML probability to act (0–1)              |
 | `RETRAIN_EVERY_N`       | 50        | Retrain model every N new candles            |
+| `REQUIRE_TREND`         | true      | Skip BUY when regime filter says ranging     |
+| `ADX_THRESHOLD`         | 20.0      | ADX level used by regime filter              |
+
+---
+
+## Offline Training (optional)
+
+Download full history and train on multiple assets:
+
+```bash
+python fetch_all_history.py --timeframe 1h
+python train_lgbm.py --use-saved --timeframe 1h
+```
 
 ---
 
 ## Upgrading the Strategy
 
-The strategy lives entirely in `strategy.py`. To upgrade:
+The strategy lives in `strategy.py`. To upgrade:
 - **LSTM/Transformer**: Replace LightGBM with a PyTorch sequence model
 - **More features**: Add to `features.py` → `FEATURE_COLS`
-- **Regime detection**: Add a volatility-regime classifier before the signal model
+- **Regime detection**: Tune `is_trending()` in `features.py`
 - **Shorts**: Enable `side='short'` in `risk.py` and use Binance Futures testnet
 
 ---
