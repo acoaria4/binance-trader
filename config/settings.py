@@ -25,8 +25,15 @@ RETRAIN_EVERY_N          = int(os.getenv("RETRAIN_EVERY_N", 50))
 MIN_SIGNAL_CONFIDENCE    = float(os.getenv("MIN_SIGNAL_CONFIDENCE", 0.62))  # Balanced: high enough to filter noise, low enough to trade
 
 # Regime filter
-ADX_THRESHOLD            = float(os.getenv("ADX_THRESHOLD", 20.0))  # Min ADX to allow trades
+ADX_THRESHOLD            = float(os.getenv("ADX_THRESHOLD", 20.0))
+MIN_ATR_RATIO            = float(os.getenv("MIN_ATR_RATIO", 0.8))
 REQUIRE_TREND            = os.getenv("REQUIRE_TREND", "true").lower() == "true"
+
+# ML retrain gate (walk-forward macro-F1 must meet this to deploy)
+RETRAIN_MIN_F1           = float(os.getenv("RETRAIN_MIN_F1", 0.30))
+
+# Position persistence
+POSITIONS_FILE           = os.getenv("POSITIONS_FILE", "logs/positions.json")
 
 # Logging
 LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO")

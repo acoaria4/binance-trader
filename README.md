@@ -80,21 +80,22 @@ Feature Engineering ────────────────────
         ▼
 LightGBM Classifier
   Predicts: BUY / HOLD / SELL
-  Trained on percentile-based forward-looking labels:
-    score = max_return + min_return over next 10 candles
-    BUY  = top 25% scores
-    SELL = bottom 25% scores
-    HOLD = middle 50%
+  Triple-barrier labels (aligned with live SL/TP):
+    BUY  = take-profit hit before stop-loss within 10 candles
+    SELL = stop-loss hit before take-profit
+    HOLD = neither barrier hit in time
+  Retrain only deploys if walk-forward macro-F1 >= RETRAIN_MIN_F1
         │
         ▼
 Regime Filter (optional, REQUIRE_TREND=true)
-  BUY only when market looks trending (ADX, EMA stack, or price vs EMA200)
+  BUY only when ADX strong AND ATR healthy AND structure trending
         │
         ▼
 Risk Manager
   - Checks MAX_OPEN_TRADES
   - Sizes position from TRADE_AMOUNT_USDT
   - Sets stop-loss, take-profit, and trailing stop
+  - Persists open positions to logs/positions.json
         │
         ▼
 Order Executor
@@ -121,8 +122,11 @@ Binance API (full depth). Orders are placed on Binance Testnet only.
 | `TAKE_PROFIT_PCT`       | 5.0       | % above entry to take profit                 |
 | `MIN_SIGNAL_CONFIDENCE` | 0.62      | Min ML probability to act (0–1)              |
 | `RETRAIN_EVERY_N`       | 50        | Retrain model every N new candles            |
+| `RETRAIN_MIN_F1`        | 0.30      | Min walk-forward F1 to deploy a retrained model |
 | `REQUIRE_TREND`         | true      | Skip BUY when regime filter says ranging     |
-| `ADX_THRESHOLD`         | 20.0      | ADX level used by regime filter              |
+| `ADX_THRESHOLD`         | 20.0      | Min ADX for regime filter                    |
+| `MIN_ATR_RATIO`         | 0.8       | Min ATR ratio for regime filter              |
+| `POSITIONS_FILE`        | logs/positions.json | Persisted open positions path        |
 
 ---
 

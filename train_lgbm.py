@@ -15,21 +15,14 @@ import argparse
 import os
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-import pickle
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
 
 from exchange  import get_data_exchange, fetch_ohlcv
 from features  import compute_features, FEATURE_COLS, is_trending
-from strategy  import make_labels
+from strategy  import MLStrategy
 from config    import settings
 from utils.logger import get_logger
 
 log = get_logger("train_lgbm")
-
-MODEL_PATH  = "models/lgbm_model.pkl"
-SCALER_PATH = "models/scaler.pkl"
 
 
 def load_saved_data(timeframe: str, symbols: list) -> tuple:
@@ -54,56 +47,11 @@ def load_saved_data(timeframe: str, symbols: list) -> tuple:
 
 
 def train_lgbm(df_train: pd.DataFrame) -> tuple:
-    """Train LightGBM on the provided dataframe."""
-    log.info(f"Computing features for {len(df_train):,} candles ...")
-    df = compute_features(df_train)
-    df["label"] = make_labels(df)
-    df.dropna(inplace=True)
-
-    X = df[FEATURE_COLS].values
-    y = df["label"].values
-    y_mapped = y + 1   # SELL/HOLD/BUY: -1/0/1 -> LightGBM classes 0/1/2
-
-    log.info(f"Label distribution: SELL={int(np.sum(y==-1))} HOLD={int(np.sum(y==0))} BUY={int(np.sum(y==1))}")
-
-    scaler = StandardScaler()
-    X_sc   = scaler.fit_transform(X)
-
-    model = lgb.LGBMClassifier(
-        n_estimators=500,        # More trees with more data
-        learning_rate=0.03,
-        num_leaves=31,
-        max_depth=6,
-        min_child_samples=50,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        class_weight="balanced",
-        random_state=42,
-        verbose=-1,
-        n_jobs=-1,               # Use all CPU cores
-    )
-
-    log.info("Training LightGBM ...")
-    model.fit(X_sc, y_mapped)
-
-    # Validation report on last 20% of training data
-    split   = int(len(X_sc) * 0.8)
-    val_pred = model.predict(X_sc[split:])
-    log.info("\n" + classification_report(
-        y_mapped[split:], val_pred,
-        target_names=["SELL", "HOLD", "BUY"],
-        zero_division=0,
-    ))
-
-    # Save model
-    os.makedirs("models", exist_ok=True)
-    with open(MODEL_PATH,  "wb") as f: pickle.dump(model,  f)
-    with open(SCALER_PATH, "wb") as f: pickle.dump(scaler, f)
-    log.info(f"Model saved to {MODEL_PATH}")
-
-    return model, scaler
+    """Train via MLStrategy (triple-barrier labels + walk-forward validation)."""
+    log.info(f"Training on {len(df_train):,} candles via MLStrategy ...")
+    strat = MLStrategy()
+    strat.train(df_train, force=True)
+    return strat.model, strat.scaler
 
 
 def run_backtest(model, scaler, df_test_raw: pd.DataFrame) -> None:

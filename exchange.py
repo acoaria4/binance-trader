@@ -126,19 +126,44 @@ def get_balance(exchange: ccxt.binance, currency: str = "USDT") -> float:
     return free
 
 
+def place_market_buy(exchange: ccxt.binance,
+                     symbol: str,
+                     amount_usdt: float) -> dict:
+    """Market buy using a USDT notional."""
+    ticker = exchange.fetch_ticker(symbol)
+    price  = ticker["last"]
+    qty    = exchange.amount_to_precision(symbol, amount_usdt / price)
+    order  = exchange.create_order(
+        symbol=symbol, type="market", side="buy", amount=float(qty),
+    )
+    log.info(f"Market BUY {qty} {symbol} @ ~{price:.2f} USDT (~{amount_usdt:.2f} USDT)")
+    return order
+
+
+def place_market_sell(exchange: ccxt.binance,
+                      symbol: str,
+                      quantity: float) -> dict:
+    """Market sell using base-asset quantity."""
+    ticker = exchange.fetch_ticker(symbol)
+    price  = ticker["last"]
+    qty    = exchange.amount_to_precision(symbol, quantity)
+    order  = exchange.create_order(
+        symbol=symbol, type="market", side="sell", amount=float(qty),
+    )
+    log.info(f"Market SELL {qty} {symbol} @ ~{price:.2f}")
+    return order
+
+
 def place_market_order(exchange: ccxt.binance,
                        symbol: str,
                        side: str,
                        amount_usdt: float) -> dict:
-    ticker = exchange.fetch_ticker(symbol)
-    price  = ticker["last"]
-    qty    = amount_usdt / price
-    qty    = exchange.amount_to_precision(symbol, qty)
-    order  = exchange.create_order(
-        symbol=symbol, type="market", side=side, amount=float(qty),
+    """Backward-compatible wrapper — USDT notional for both sides."""
+    if side.lower() == "buy":
+        return place_market_buy(exchange, symbol, amount_usdt)
+    raise ValueError(
+        "place_market_order(sell) is deprecated — use place_market_sell(symbol, quantity)"
     )
-    log.info(f"Order placed -> {side.upper()} {qty} {symbol} @ ~{price:.2f} USDT")
-    return order
 
 
 def place_limit_order(exchange: ccxt.binance,
