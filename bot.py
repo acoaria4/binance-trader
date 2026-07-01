@@ -1,11 +1,6 @@
 """
 bot.py
-Main trading bot loop with EV gating and signal audit logging.
-
-Run with:
-    python bot.py
-
-Press Ctrl+C to stop cleanly.
+Main trading bot loop with EV gating, volatility sizing, and portfolio risk controls.
 """
 import time
 import sys
@@ -21,6 +16,7 @@ from exchange import (
 )
 from strategy           import MLStrategy
 from risk               import RiskManager
+from features           import compute_features
 from utils.trade_logger import TradeLogger
 from utils.signal_logger import SignalLogger
 from utils.logger       import get_logger
@@ -37,26 +33,35 @@ def print_banner():
     console.print("""
 [bold cyan]╔══════════════════════════════════════════╗
 ║   KEW AI Trading Bot  •  Binance Testnet ║
-║   v5: EV Gate + Calibrated Conviction    ║
+║   v6: Volatility Sizing + Portfolio Risk   ║
 ╚══════════════════════════════════════════╝[/bold cyan]
 """)
 
 
-def print_status(balance: float, n_positions: int, evaluation, last_price: float):
+def print_status(balance: float, risk: RiskManager, evaluation, last_price: float):
     table = Table(box=box.SIMPLE, show_header=False)
     table.add_column("Key",   style="dim")
     table.add_column("Value", style="bold")
     table.add_row("Symbol",      settings.SYMBOL)
     table.add_row("Timeframe",   settings.TIMEFRAME)
     table.add_row("Balance",     f"{balance:.2f} USDT")
-    table.add_row("Open trades", f"{n_positions} / {settings.MAX_OPEN_TRADES}")
+    table.add_row("Open trades", f"{len(risk.open_positions)} / {settings.MAX_OPEN_TRADES}")
     table.add_row("Last price",  f"{last_price:.2f}")
-    table.add_row("Signal",      evaluation.signal if evaluation else "—")
-    table.add_row("P(win)",      f"{evaluation.p_win:.1%}" if evaluation else "—")
-    table.add_row("EV",          f"{evaluation.ev:.4f}" if evaluation else "—")
-    table.add_row("Conviction",  f"{evaluation.conviction:.2f}" if evaluation else "—")
+    if evaluation:
+        table.add_row("Signal",     evaluation.signal)
+        table.add_row("P(win)",     f"{evaluation.p_win:.1%}")
+        table.add_row("EV",         f"{evaluation.ev:.4f}")
+        table.add_row("Conviction", f"{evaluation.conviction:.2f}")
+    table.add_row("Portfolio",   risk.portfolio_summary(balance))
     table.add_row("Time (UTC)",  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     console.print(table)
+
+
+def _get_atr(df) -> float:
+    feat = compute_features(df)
+    if feat.empty or "atr_14" not in feat.columns:
+        return None
+    return float(feat["atr_14"].iloc[-1])
 
 
 def run():
@@ -88,12 +93,15 @@ def run():
             bar_low       = float(df["low"].iloc[-1])
             current_price = float(df["close"].iloc[-1])
             current_ts    = df.index[-1]
+            atr           = _get_atr(df)
 
             exits = risk.check_exits(bar_high, bar_low)
+            balance = get_balance(trade_exchange)
             for pos, reason in exits:
                 pnl_pct = pos.pnl_pct(current_price)
                 place_market_sell(trade_exchange, pos.symbol, pos.quantity)
                 risk.close_position(pos.symbol)
+                risk.record_closed_trade(pnl_pct, balance)
                 trade_logger.log_trade(
                     symbol=pos.symbol, action=f"SELL_{reason.upper()}",
                     price=current_price, quantity=pos.quantity,
@@ -108,7 +116,7 @@ def run():
                 df_train = fetch_ohlcv(data_exchange, limit=TRAIN_FETCH_LIMIT)
                 strategy.on_new_candle(df_train)
 
-                evaluation = strategy.evaluate(df)
+                evaluation = strategy.evaluate(df, atr=atr)
                 last_evaluation = evaluation
                 signal_logger.log(settings.SYMBOL, evaluation, "EVAL")
 
@@ -123,6 +131,7 @@ def run():
                         pnl = pos.pnl_pct(current_price)
                         place_market_sell(trade_exchange, pos.symbol, pos.quantity)
                         risk.close_position(pos.symbol)
+                        risk.record_closed_trade(pnl, balance)
                         trade_logger.log_trade(
                             symbol=pos.symbol, action="SELL_SIGNAL",
                             price=current_price, quantity=pos.quantity,
@@ -133,41 +142,48 @@ def run():
                         log.info(f"SELL signal exit | PnL: {pnl:+.2f}%")
 
                 elif evaluation.should_enter:
-                    allowed, block_reason = risk.can_open_trade(settings.SYMBOL)
-                    if allowed:
-                        balance = get_balance(trade_exchange)
-                        sizing  = risk.calculate_position(current_price, balance)
-                        order   = place_market_buy(
-                            trade_exchange, settings.SYMBOL,
-                            settings.TRADE_AMOUNT_USDT,
+                    sizing = risk.calculate_position(current_price, balance, atr=atr)
+                    allowed, block_reason = risk.can_open_trade(
+                        settings.SYMBOL, balance, sizing["risk_usdt"],
+                    )
+                    if allowed and sizing["trade_usdt"] > 0:
+                        order = place_market_buy(
+                            trade_exchange, settings.SYMBOL, sizing["trade_usdt"],
                         )
                         risk.open_position(
                             symbol=settings.SYMBOL,
                             entry_price=current_price,
                             quantity=sizing["qty"],
+                            stop_loss=sizing["stop_loss"],
+                            take_profit=sizing["take_profit"],
+                            trail_distance_pct=sizing["trail_distance_pct"],
+                            risk_usdt=sizing["risk_usdt"],
                             order_id=order.get("id"),
                         )
                         trade_logger.log_trade(
                             symbol=settings.SYMBOL, action="BUY",
                             price=current_price, quantity=sizing["qty"],
                             signal_confidence=evaluation.p_win,
-                            reason="ev_conviction",
+                            reason="ev_conviction_risk_sized",
                         )
                         signal_logger.log(settings.SYMBOL, evaluation, "ENTER")
                         log.info(
-                            f"BUY | P(win)={evaluation.p_win:.1%} "
-                            f"EV={evaluation.ev:.4f} conviction={evaluation.conviction:.2f}"
+                            f"BUY {sizing['trade_usdt']:.2f} USDT | "
+                            f"P(win)={evaluation.p_win:.1%} EV={evaluation.ev:.4f} "
+                            f"conviction={evaluation.conviction:.2f} | "
+                            f"SL={sizing['stop_loss_pct']:.2f}% TP={sizing['take_profit_pct']:.2f}%"
                         )
                     else:
-                        log.info(f"BUY blocked: {block_reason}")
-                        signal_logger.log(settings.SYMBOL, evaluation, f"SKIP_{block_reason}")
+                        reason = block_reason if not allowed else "zero_size"
+                        log.info(f"BUY blocked: {reason}")
+                        signal_logger.log(settings.SYMBOL, evaluation, f"SKIP_{reason}")
                 else:
                     log.info(f"No entry: {evaluation.block_reason}")
                     signal_logger.log(settings.SYMBOL, evaluation, f"SKIP_{evaluation.block_reason}")
 
             balance = get_balance(trade_exchange)
-            print_status(balance, len(risk.open_positions),
-                         last_evaluation, current_price)
+            risk.portfolio.update_peak(balance)
+            print_status(balance, risk, last_evaluation, current_price)
             console.print(risk.summary())
 
             time.sleep(30)

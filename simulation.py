@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from config import settings
+from risk_sizing import barriers_for_entry
 
 
 @dataclass
@@ -23,14 +24,24 @@ class LongTradeState:
     take_profit: float
     highest_price: float
     trailing_active: bool = False
+    trail_distance_pct: float = None
 
     @classmethod
-    def from_entry(cls, entry_price: float) -> "LongTradeState":
+    def from_entry(cls, entry_price: float, barriers=None) -> "LongTradeState":
+        if barriers is not None:
+            return cls(
+                entry_price=entry_price,
+                stop_loss=barriers.stop_loss,
+                take_profit=barriers.take_profit,
+                highest_price=entry_price,
+                trail_distance_pct=barriers.trail_distance_pct,
+            )
         return cls(
             entry_price=entry_price,
             stop_loss=entry_price * (1 - settings.STOP_LOSS_PCT / 100),
             take_profit=entry_price * (1 + settings.TAKE_PROFIT_PCT / 100),
             highest_price=entry_price,
+            trail_distance_pct=settings.TRAIL_DISTANCE_PCT,
         )
 
 
@@ -44,7 +55,7 @@ def update_trailing(state: LongTradeState, bar_high: float) -> None:
         state.trailing_active = True
 
     if state.trailing_active:
-        trail_distance = settings.TRAIL_DISTANCE_PCT
+        trail_distance = state.trail_distance_pct or settings.TRAIL_DISTANCE_PCT
         new_sl = state.highest_price * (1 - trail_distance / 100)
         if new_sl > state.stop_loss:
             state.stop_loss = new_sl
@@ -111,13 +122,14 @@ def simulate_forward_trade(
     highs: np.ndarray,
     lows: np.ndarray,
     horizon: int = None,
+    barriers=None,
 ) -> tuple[int, float, Optional[str]]:
     """
     Walk forward through bars after entry.
     Returns (label, pnl_fraction, exit_reason).
     """
     horizon = horizon or settings.FORWARD_CANDLES
-    state = LongTradeState.from_entry(entry_price)
+    state = LongTradeState.from_entry(entry_price, barriers=barriers)
 
     for j in range(min(horizon, len(highs))):
         reason, exit_px = check_bar_exit(state, float(highs[j]), float(lows[j]))
@@ -136,6 +148,7 @@ def make_labels(df: pd.DataFrame, forward_candles: int = None) -> pd.Series:
     close = df["close"].values
     high  = df["high"].values
     low   = df["low"].values
+    atrs  = df["atr_14"].values if "atr_14" in df.columns else None
     labels = []
 
     for i in range(len(df)):
@@ -143,12 +156,15 @@ def make_labels(df: pd.DataFrame, forward_candles: int = None) -> pd.Series:
             labels.append(np.nan)
             continue
 
+        atr = float(atrs[i]) if atrs is not None and not np.isnan(atrs[i]) else None
+        barriers = barriers_for_entry(float(close[i]), atr)
         end = min(i + 1 + horizon, len(df))
         label, _, _ = simulate_forward_trade(
             float(close[i]),
             high[i + 1:end],
             low[i + 1:end],
             horizon=end - i - 1,
+            barriers=barriers,
         )
         labels.append(label)
 
@@ -214,14 +230,24 @@ def run_trading_simulation(
             ev = evaluate_fn(window)
             if not ev.should_enter:
                 continue
+            feat = compute_features(window)
+            atr = float(feat["atr_14"].iloc[-1]) if not feat.empty and "atr_14" in feat.columns else None
+            barriers = barriers_for_entry(float(row["close"]), atr)
             in_trade = True
-            state = LongTradeState.from_entry(apply_entry_costs(float(row["close"])))
+            state = LongTradeState.from_entry(
+                apply_entry_costs(float(row["close"])), barriers=barriers,
+            )
             continue
 
         signal, conf = predict_fn(window)
         if signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+            feat = compute_features(window)
+            atr = float(feat["atr_14"].iloc[-1]) if not feat.empty and "atr_14" in feat.columns else None
+            barriers = barriers_for_entry(float(row["close"]), atr)
             in_trade = True
-            state = LongTradeState.from_entry(apply_entry_costs(float(row["close"])))
+            state = LongTradeState.from_entry(
+                apply_entry_costs(float(row["close"])), barriers=barriers,
+            )
 
     return compute_trade_metrics(pnls)
 
