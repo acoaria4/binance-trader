@@ -1,6 +1,6 @@
 """
 bot.py
-Main trading bot loop.
+Main trading bot loop with EV gating and signal audit logging.
 
 Run with:
     python bot.py
@@ -22,8 +22,8 @@ from exchange import (
 from strategy           import MLStrategy
 from risk               import RiskManager
 from utils.trade_logger import TradeLogger
+from utils.signal_logger import SignalLogger
 from utils.logger       import get_logger
-from features           import compute_features, is_trending
 from config             import settings
 
 log     = get_logger("bot")
@@ -37,14 +37,12 @@ def print_banner():
     console.print("""
 [bold cyan]╔══════════════════════════════════════════╗
 ║   KEW AI Trading Bot  •  Binance Testnet ║
-║   Strategy: LightGBM + Trailing Simulation ║
-║   v4: PnL validation + intrabar exits      ║
+║   v5: EV Gate + Calibrated Conviction    ║
 ╚══════════════════════════════════════════╝[/bold cyan]
 """)
 
 
-def print_status(balance: float, n_positions: int, last_signal: str,
-                 last_conf: float, last_price: float):
+def print_status(balance: float, n_positions: int, evaluation, last_price: float):
     table = Table(box=box.SIMPLE, show_header=False)
     table.add_column("Key",   style="dim")
     table.add_column("Value", style="bold")
@@ -53,8 +51,10 @@ def print_status(balance: float, n_positions: int, last_signal: str,
     table.add_row("Balance",     f"{balance:.2f} USDT")
     table.add_row("Open trades", f"{n_positions} / {settings.MAX_OPEN_TRADES}")
     table.add_row("Last price",  f"{last_price:.2f}")
-    table.add_row("Signal",      last_signal)
-    table.add_row("Confidence",  f"{last_conf:.1%}")
+    table.add_row("Signal",      evaluation.signal if evaluation else "—")
+    table.add_row("P(win)",      f"{evaluation.p_win:.1%}" if evaluation else "—")
+    table.add_row("EV",          f"{evaluation.ev:.4f}" if evaluation else "—")
+    table.add_row("Conviction",  f"{evaluation.conviction:.2f}" if evaluation else "—")
     table.add_row("Time (UTC)",  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     console.print(table)
 
@@ -67,6 +67,7 @@ def run():
     strategy       = MLStrategy()
     risk           = RiskManager()
     trade_logger   = TradeLogger()
+    signal_logger  = SignalLogger()
 
     risk.reconcile(trade_exchange, settings.SYMBOL)
 
@@ -75,8 +76,7 @@ def run():
     if strategy.model is None:
         strategy.train(df_init, force=True)
 
-    last_signal = "—"
-    last_conf   = 0.0
+    last_evaluation = None
     last_candle = None
 
     log.info("Bot live. Entering main loop. Press Ctrl+C to stop.")
@@ -108,21 +108,17 @@ def run():
                 df_train = fetch_ohlcv(data_exchange, limit=TRAIN_FETCH_LIMIT)
                 strategy.on_new_candle(df_train)
 
-                signal, conf = strategy.predict(df)
-                last_signal, last_conf = signal, conf
+                evaluation = strategy.evaluate(df)
+                last_evaluation = evaluation
+                signal_logger.log(settings.SYMBOL, evaluation, "EVAL")
 
-                df_feat  = compute_features(df)
-                trending = not settings.REQUIRE_TREND or \
-                           is_trending(df_feat, settings.ADX_THRESHOLD)
-
-                if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                if evaluation.should_exit:
                     symbol_positions = [
                         p for p in risk.open_positions if p.symbol == settings.SYMBOL
                     ]
                     if not symbol_positions:
-                        log.info(
-                            "SELL signal (long-only): no open position — standing aside"
-                        )
+                        log.info("SELL signal (long-only): no open position — standing aside")
+                        signal_logger.log(settings.SYMBOL, evaluation, "SKIP_EXIT_FLAT")
                     for pos in symbol_positions:
                         pnl = pos.pnl_pct(current_price)
                         place_market_sell(trade_exchange, pos.symbol, pos.quantity)
@@ -130,40 +126,48 @@ def run():
                         trade_logger.log_trade(
                             symbol=pos.symbol, action="SELL_SIGNAL",
                             price=current_price, quantity=pos.quantity,
-                            signal_confidence=conf,
+                            signal_confidence=evaluation.p_buy,
                             reason="ml_sell_signal", pnl_pct=pnl,
                         )
+                        signal_logger.log(settings.SYMBOL, evaluation, "EXIT")
                         log.info(f"SELL signal exit | PnL: {pnl:+.2f}%")
 
-                elif signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-                    if not trending:
-                        log.info("Regime filter: not trending — BUY skipped")
+                elif evaluation.should_enter:
+                    allowed, block_reason = risk.can_open_trade(settings.SYMBOL)
+                    if allowed:
+                        balance = get_balance(trade_exchange)
+                        sizing  = risk.calculate_position(current_price, balance)
+                        order   = place_market_buy(
+                            trade_exchange, settings.SYMBOL,
+                            settings.TRADE_AMOUNT_USDT,
+                        )
+                        risk.open_position(
+                            symbol=settings.SYMBOL,
+                            entry_price=current_price,
+                            quantity=sizing["qty"],
+                            order_id=order.get("id"),
+                        )
+                        trade_logger.log_trade(
+                            symbol=settings.SYMBOL, action="BUY",
+                            price=current_price, quantity=sizing["qty"],
+                            signal_confidence=evaluation.p_win,
+                            reason="ev_conviction",
+                        )
+                        signal_logger.log(settings.SYMBOL, evaluation, "ENTER")
+                        log.info(
+                            f"BUY | P(win)={evaluation.p_win:.1%} "
+                            f"EV={evaluation.ev:.4f} conviction={evaluation.conviction:.2f}"
+                        )
                     else:
-                        allowed, block_reason = risk.can_open_trade(settings.SYMBOL)
-                        if allowed:
-                            balance = get_balance(trade_exchange)
-                            sizing  = risk.calculate_position(current_price, balance)
-                            order   = place_market_buy(
-                                trade_exchange, settings.SYMBOL,
-                                settings.TRADE_AMOUNT_USDT,
-                            )
-                            risk.open_position(
-                                symbol=settings.SYMBOL,
-                                entry_price=current_price,
-                                quantity=sizing["qty"],
-                                order_id=order.get("id"),
-                            )
-                            trade_logger.log_trade(
-                                symbol=settings.SYMBOL, action="BUY",
-                                price=current_price, quantity=sizing["qty"],
-                                signal_confidence=conf, reason="ml_signal",
-                            )
-                        else:
-                            log.info(f"BUY blocked: {block_reason}")
+                        log.info(f"BUY blocked: {block_reason}")
+                        signal_logger.log(settings.SYMBOL, evaluation, f"SKIP_{block_reason}")
+                else:
+                    log.info(f"No entry: {evaluation.block_reason}")
+                    signal_logger.log(settings.SYMBOL, evaluation, f"SKIP_{evaluation.block_reason}")
 
             balance = get_balance(trade_exchange)
             print_status(balance, len(risk.open_positions),
-                         last_signal, last_conf, current_price)
+                         last_evaluation, current_price)
             console.print(risk.summary())
 
             time.sleep(30)

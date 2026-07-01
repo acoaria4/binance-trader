@@ -14,7 +14,14 @@ kew_trading_bot/
 ├── exchange.py         ← Binance Testnet connector (ccxt)
 ├── features.py         ← Technical indicator feature engineering
 ├── strategy.py         ← LightGBM ML strategy engine
+├── ev_gate.py          ← EV + conviction scoring
 ├── simulation.py       ← Shared trailing-stop + label simulation
+├── backtest/
+│   └── engine.py       ← Unified backtest engine
+├── evaluation/
+│   └── purged_cv.py    ← Purged walk-forward splits
+├── reports/
+│   └── backtest_report.py ← JSON backtest artifacts
 ├── risk.py             ← Position sizing + stop-loss/take-profit
 ├── train_lgbm.py       ← Offline training on large/multi-asset datasets
 ├── fetch_all_history.py← Bulk historical data download
@@ -23,9 +30,11 @@ kew_trading_bot/
 │   └── settings.py     ← All settings loaded from .env
 ├── utils/
 │   ├── logger.py       ← Rich-enhanced logging
-│   └── trade_logger.py ← CSV trade journal
+│   ├── trade_logger.py ← CSV trade journal
+│   └── signal_logger.py← CSV signal audit log (every skip/enter)
 ├── models/             ← Saved model + scaler (auto-created)
 ├── logs/               ← Log + trade CSV (auto-created)
+├── reports/            ← Backtest JSON reports (auto-created)
 ├── data/               ← Saved OHLCV/feature CSVs (auto-created)
 ├── .env.example        ← Copy to .env and fill in your keys
 └── requirements.txt
@@ -130,7 +139,11 @@ Binance API (full depth). Orders are placed on Binance Testnet only.
 | `TRAIL_ACTIVATE_PCT`    | 1.0       | Gain % before trailing stop activates        |
 | `TRAIL_DISTANCE_PCT`    | 1.5       | Trail distance below high (defaults to SL)   |
 | `FORWARD_CANDLES`       | 10        | Label / forward simulation horizon           |
-| `REQUIRE_TREND`         | true      | Skip BUY when regime filter says ranging     |
+| `FEE_PCT` / `SLIPPAGE_PCT` | 0.10 / 0.05 | Per-side costs in backtest + EV gate     |
+| `EV_MIN`                | 0.005     | Min expected value (fraction) to enter       |
+| `P_WIN_MIN`             | 0.55      | Min calibrated P(BUY) to enter               |
+| `CONVICTION_MIN`        | 0.65      | Master conviction score threshold            |
+| `REQUIRE_MTF`           | true      | Require 4h timeframe alignment for entries   |
 | `ADX_THRESHOLD`         | 20.0      | Min ADX for regime filter                    |
 | `MIN_ATR_RATIO`         | 0.8       | Min ATR ratio for regime filter              |
 | `POSITIONS_FILE`        | logs/positions.json | Persisted open positions path        |

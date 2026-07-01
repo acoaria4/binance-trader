@@ -78,6 +78,25 @@ def pnl_at_price(entry_price: float, exit_price: float) -> float:
     return (exit_price - entry_price) / entry_price
 
 
+def apply_entry_costs(price: float) -> float:
+    """Effective buy price after slippage + fee."""
+    pct = (settings.SLIPPAGE_PCT + settings.FEE_PCT) / 100
+    return price * (1 + pct)
+
+
+def apply_exit_costs(price: float) -> float:
+    """Effective sell price after slippage + fee."""
+    pct = (settings.SLIPPAGE_PCT + settings.FEE_PCT) / 100
+    return price * (1 - pct)
+
+
+def net_pnl_fraction(entry_price: float, exit_price: float) -> float:
+    """Net fractional PnL after round-trip costs."""
+    entry_eff = apply_entry_costs(entry_price)
+    exit_eff  = apply_exit_costs(exit_price)
+    return (exit_eff - entry_eff) / entry_eff
+
+
 def label_from_pnl(pnl: float) -> int:
     """Map trade outcome to ML label: BUY=+1, HOLD=0, SELL=-1."""
     if pnl > 0.001:
@@ -141,6 +160,7 @@ def run_trading_simulation(
     row_indices: np.ndarray,
     predict_fn,
     regime_check_fn=None,
+    evaluate_fn=None,
     min_window: int = 250,
 ) -> dict:
     """
@@ -166,12 +186,17 @@ def run_trading_simulation(
         if in_trade and state is not None:
             reason, exit_px = check_bar_exit(state, bar_high, bar_low)
             if reason is None:
-                signal, conf = predict_fn(window)
-                if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-                    reason, exit_px = "signal", float(row["close"])
+                if evaluate_fn is not None:
+                    ev = evaluate_fn(window)
+                    if ev.should_exit:
+                        reason, exit_px = "signal", apply_exit_costs(float(row["close"]))
+                else:
+                    signal, conf = predict_fn(window)
+                    if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
+                        reason, exit_px = "signal", apply_exit_costs(float(row["close"]))
 
             if reason:
-                pnls.append(pnl_at_price(state.entry_price, exit_px))
+                pnls.append(net_pnl_fraction(state.entry_price, exit_px))
                 in_trade = False
                 state = None
             continue
@@ -185,10 +210,18 @@ def run_trading_simulation(
             if not is_trending(feat, settings.ADX_THRESHOLD):
                 continue
 
+        if evaluate_fn is not None:
+            ev = evaluate_fn(window)
+            if not ev.should_enter:
+                continue
+            in_trade = True
+            state = LongTradeState.from_entry(apply_entry_costs(float(row["close"])))
+            continue
+
         signal, conf = predict_fn(window)
         if signal == "BUY" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
             in_trade = True
-            state = LongTradeState.from_entry(float(row["close"]))
+            state = LongTradeState.from_entry(apply_entry_costs(float(row["close"])))
 
     return compute_trade_metrics(pnls)
 

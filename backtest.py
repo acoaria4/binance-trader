@@ -1,154 +1,49 @@
 """
 backtest.py
-Walk-forward backtester with periodic retraining, regime filter,
-and shared trailing-stop simulation (intrabar high/low).
+CLI wrapper around the unified BacktestEngine.
 
 Usage:
     python backtest.py --symbol BTC/USDT --timeframe 1h --limit 5000
 """
 import argparse
-import pandas as pd
-import numpy as np
 
-from exchange    import get_data_exchange, fetch_ohlcv
-from features    import compute_features, is_trending
-from strategy    import MLStrategy
-from simulation  import LongTradeState, check_bar_exit, pnl_at_price
-from config      import settings
+from exchange import get_data_exchange, fetch_ohlcv
+from strategy import MLStrategy
+from backtest.engine import BacktestConfig, BacktestEngine
+from reports.backtest_report import save_backtest_report, print_backtest_summary, build_report
+from config import settings
 from utils.logger import get_logger
 
 log = get_logger("backtest")
 
-MIN_WINDOW = 250
-
 
 def run_backtest(symbol: str, timeframe: str, limit: int,
-                 train_frac: float = 0.6) -> None:
+                 train_frac: float = 0.6) -> dict:
 
     exchange = get_data_exchange()
     df_raw   = fetch_ohlcv(exchange, symbol=symbol, timeframe=timeframe, limit=limit)
 
-    split        = int(len(df_raw) * train_frac)
-    df_train_raw = df_raw.iloc[:split]
-    df_test_raw  = df_raw.iloc[split:]
-
-    log.info(f"Train candles: {len(df_train_raw)} | Test candles: {len(df_test_raw)}")
+    split = int(len(df_raw) * train_frac)
+    log.info(f"Train candles: {split} | Test candles: {len(df_raw) - split}")
 
     strat = MLStrategy()
-    strat.train(df_train_raw, force=True)
+    strat.train(df_raw.iloc[:split], force=True)
 
-    capital           = 1000.0
-    equity            = [capital]
-    trades            = []
-    in_trade          = False
-    trade_state       = None
-    skipped_regime    = 0
-    skipped_conf      = 0
-    skipped_sell_flat = 0
-    retrain_count     = 0
-    signal_counts     = {}
+    config = BacktestConfig(symbol=symbol, timeframe=timeframe)
+    engine = BacktestEngine(config)
+    result = engine.run(df_raw, strat, test_start_idx=split)
 
-    test_start_raw = split
+    report_dict = result.to_report_dict()
+    report = build_report(report_dict)
+    report["_equity"] = result.equity
 
-    for i, (ts, row) in enumerate(df_test_raw.iterrows()):
-        abs_i  = test_start_raw + i
-        window = df_raw.iloc[max(0, abs_i - max(settings.LOOKBACK_CANDLES, MIN_WINDOW)):abs_i + 1]
-        if len(window) < MIN_WINDOW:
-            continue
+    print_backtest_summary(report)
+    print(f"  Retrains:          {result.retrain_count}")
+    print(f"  Signal counts:     {result.signal_counts}")
 
-        bar_high  = float(row["high"])
-        bar_low   = float(row["low"])
-        bar_close = float(row["close"])
-
-        train_window = df_raw.iloc[max(0, abs_i + 1 - 2000):abs_i + 1]
-        if strat.on_new_candle(train_window):
-            retrain_count += 1
-
-        if in_trade and trade_state is not None:
-            reason, exit_px = check_bar_exit(trade_state, bar_high, bar_low)
-
-            if reason is None:
-                signal, conf = strat.predict(window)
-                signal_counts[signal] = signal_counts.get(signal, 0) + 1
-                if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-                    reason, exit_px = "signal", bar_close
-
-            if reason:
-                pnl_pct = pnl_at_price(trade_state.entry_price, exit_px) * 100
-                capital *= (1 + pnl_pct / 100)
-                equity.append(capital)
-                trades.append({
-                    "ts": ts, "action": f"SELL_{reason.upper()}",
-                    "price": exit_px, "pnl_pct": pnl_pct,
-                })
-                in_trade = False
-                trade_state = None
-            continue
-
-        window_feat = compute_features(window)
-        if settings.REQUIRE_TREND and not is_trending(window_feat, settings.ADX_THRESHOLD):
-            skipped_regime += 1
-            continue
-
-        signal, conf = strat.predict(window)
-        signal_counts[signal] = signal_counts.get(signal, 0) + 1
-
-        if signal == "SELL" and conf >= settings.MIN_SIGNAL_CONFIDENCE:
-            skipped_sell_flat += 1
-
-        if signal != "BUY" or conf < settings.MIN_SIGNAL_CONFIDENCE:
-            if signal == "BUY":
-                skipped_conf += 1
-            continue
-
-        in_trade    = True
-        trade_state = LongTradeState.from_entry(bar_close)
-        trades.append({"ts": ts, "action": "BUY", "price": bar_close, "conf": conf})
-
-    closed = [t for t in trades if "pnl_pct" in t]
-    wins   = [t for t in closed if t["pnl_pct"] > 0]
-    total_return = (capital - 1000) / 1000 * 100
-
-    rets   = pd.Series([t["pnl_pct"] / 100 for t in closed])
-    sharpe = (rets.mean() / rets.std() * np.sqrt(252)) if (len(rets) > 1 and rets.std() > 0) else 0
-
-    max_eq  = max(equity) if equity else 1000
-    min_eq  = min(equity) if equity else 1000
-    max_dd  = (max_eq - min_eq) / max_eq * 100
-
-    print("\n" + "─" * 52)
-    print(f"  Backtest: {symbol} | {timeframe} | {len(df_test_raw)} candles")
-    print(f"  Settings: SL={settings.STOP_LOSS_PCT}% | TP={settings.TAKE_PROFIT_PCT}% | "
-          f"Trail@{settings.TRAIL_ACTIVATE_PCT}% | MinConf={settings.MIN_SIGNAL_CONFIDENCE:.0%}")
-    print("─" * 52)
-    print(f"  Trades:            {len(closed)}")
-    print(f"  Win rate:          {len(wins)/len(closed)*100:.1f}%" if closed else "  Win rate:          N/A")
-    print(f"  Total return:      {total_return:+.2f}%")
-    print(f"  Max drawdown:      -{max_dd:.2f}%")
-    print(f"  Sharpe:            {sharpe:.2f}")
-    print(f"  Final equity:      {capital:.2f} USDT (start: 1000)")
-    print(f"  Retrains:          {retrain_count}")
-    print(f"  Skipped (regime):  {skipped_regime}")
-    print(f"  Skipped (conf):    {skipped_conf}")
-    print(f"  SELL flat (long):  {skipped_sell_flat}")
-    print(f"  Signal counts:     {signal_counts}")
-    print("─" * 52)
-
-    if len(equity) > 1:
-        mn, mx = min(equity), max(equity)
-        height = 8
-        rows   = []
-        step   = max(1, len(equity) // 60)
-        for row_i in range(height, 0, -1):
-            line  = ""
-            for val in equity[::step]:
-                norm = (val - mn) / (mx - mn + 1e-9)
-                line += "█" if norm >= row_i / height else " "
-            label = f"{mn + (mx-mn)*row_i/height:>8.0f}" if row_i in (1, height) else " " * 8
-            rows.append(f"  {label} │{line}")
-        print("\n  Equity curve (USDT)")
-        print("\n".join(rows))
-        print()
+    path = save_backtest_report(report_dict)
+    log.info(f"Report saved → {path}")
+    return report
 
 
 if __name__ == "__main__":
