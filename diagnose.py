@@ -9,13 +9,13 @@ sys.path.insert(0, ".")
 
 from exchange import get_data_exchange, fetch_ohlcv
 from features import compute_features, FEATURE_COLS
-from strategy import MLStrategy, _label
+from strategy import MLStrategy, make_labels
 from config   import settings
 
 exchange = get_data_exchange()
 df_raw   = fetch_ohlcv(exchange, limit=5000)
 df       = compute_features(df_raw)
-df["label"] = _label(df)
+df["label"] = make_labels(df)
 
 split    = int(len(df) * 0.6)
 df_train = df.iloc[:split]

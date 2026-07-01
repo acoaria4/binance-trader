@@ -5,7 +5,4 @@ lightgbm==4.4.0
 scikit-learn==1.5.1
 ta==0.11.0
 python-dotenv==1.0.1
-websockets==12.0
-aiohttp==3.9.5
 rich==13.7.1
-apscheduler==3.10.4

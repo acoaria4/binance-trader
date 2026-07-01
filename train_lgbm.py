@@ -22,6 +22,7 @@ from sklearn.metrics import classification_report
 
 from exchange  import get_data_exchange, fetch_ohlcv
 from features  import compute_features, FEATURE_COLS, is_trending
+from strategy  import make_labels
 from config    import settings
 from utils.logger import get_logger
 
@@ -29,31 +30,6 @@ log = get_logger("train_lgbm")
 
 MODEL_PATH  = "models/lgbm_model.pkl"
 SCALER_PATH = "models/scaler.pkl"
-FORWARD_CANDLES = 10
-
-
-def make_labels(df: pd.DataFrame) -> pd.Series:
-    """Percentile-based labels — same as our proven strategy."""
-    close = df["close"]
-    scores = []
-    for i in range(len(close)):
-        if i + FORWARD_CANDLES >= len(close):
-            scores.append(np.nan)
-            continue
-        fut     = close.iloc[i+1:i+1+FORWARD_CANDLES]
-        max_ret = (fut.max() - close.iloc[i]) / close.iloc[i]
-        min_ret = (fut.min() - close.iloc[i]) / close.iloc[i]
-        scores.append(max_ret + min_ret)
-    s = pd.Series(scores, index=df.index)
-    buy_t  = s.quantile(0.75)
-    sell_t = s.quantile(0.25)
-    labels = []
-    for v in scores:
-        if pd.isna(v):       labels.append(1)
-        elif v >= buy_t:     labels.append(2)   # BUY
-        elif v <= sell_t:    labels.append(0)   # SELL
-        else:                labels.append(1)   # HOLD
-    return pd.Series(labels, index=df.index)
 
 
 def load_saved_data(timeframe: str, symbols: list) -> tuple:
@@ -86,9 +62,9 @@ def train_lgbm(df_train: pd.DataFrame) -> tuple:
 
     X = df[FEATURE_COLS].values
     y = df["label"].values
-    y_mapped = y + 1   # -1->0, 0->1, 1->2... wait labels are already 0/1/2
+    y_mapped = y + 1   # SELL/HOLD/BUY: -1/0/1 -> LightGBM classes 0/1/2
 
-    log.info(f"Label distribution: SELL={int((y==0).sum())} HOLD={int((y==1).sum())} BUY={int((y==2).sum())}")
+    log.info(f"Label distribution: SELL={int(np.sum(y==-1))} HOLD={int(np.sum(y==0))} BUY={int(np.sum(y==1))}")
 
     scaler = StandardScaler()
     X_sc   = scaler.fit_transform(X)
@@ -110,13 +86,13 @@ def train_lgbm(df_train: pd.DataFrame) -> tuple:
     )
 
     log.info("Training LightGBM ...")
-    model.fit(X_sc, y)
+    model.fit(X_sc, y_mapped)
 
     # Validation report on last 20% of training data
     split   = int(len(X_sc) * 0.8)
     val_pred = model.predict(X_sc[split:])
     log.info("\n" + classification_report(
-        y[split:], val_pred,
+        y_mapped[split:], val_pred,
         target_names=["SELL", "HOLD", "BUY"],
         zero_division=0,
     ))
